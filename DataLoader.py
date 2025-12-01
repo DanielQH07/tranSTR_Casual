@@ -41,8 +41,23 @@ class VideoQADataset(Dataset):
         self.max_samples = max_samples
         
         # Load video ids for this split
-        split_file = osp.join(sample_list_path, f'{split}.pkl')
+        # Handle different naming conventions: val.pkl vs valid.pkl
+        split_name = split
+        if split == 'val':
+            # Try val.pkl first, then valid.pkl
+            split_file = osp.join(sample_list_path, 'val.pkl')
+            if not osp.exists(split_file):
+                split_file = osp.join(sample_list_path, 'valid.pkl')
+        else:
+            split_file = osp.join(sample_list_path, f'{split}.pkl')
+        
+        if not osp.exists(split_file):
+            raise FileNotFoundError(f"Split file not found: {split_file}")
+        
         self.vids = pkload(split_file)
+        
+        if self.vids is None:
+            raise ValueError(f"Failed to load split file: {split_file}")
         
         # Limit number of videos if max_samples is set
         if max_samples is not None and max_samples > 0:
@@ -119,8 +134,21 @@ class VideoQADataset(Dataset):
 
     def _load_text(self, vid, qtype):
         """Load question, candidate answers, and ground truth from text annotations"""
+        # Try different folder structures
+        # Structure 1: text_annotation_path/vid/text.json
+        # Structure 2: text_annotation_path/QA/vid/text.json
         text_file = osp.join(self.text_annotation_path, vid, 'text.json')
         answer_file = osp.join(self.text_annotation_path, vid, 'answer.json')
+        
+        # If not found, try with QA subfolder
+        if not osp.exists(text_file):
+            text_file = osp.join(self.text_annotation_path, 'QA', vid, 'text.json')
+            answer_file = osp.join(self.text_annotation_path, 'QA', vid, 'answer.json')
+        
+        if not osp.exists(text_file):
+            raise FileNotFoundError(f"Text annotation not found for video: {vid}\n"
+                                    f"Tried: {osp.join(self.text_annotation_path, vid, 'text.json')}\n"
+                                    f"And: {osp.join(self.text_annotation_path, 'QA', vid, 'text.json')}")
         
         with open(text_file, 'r') as f:
             text = json.load(f)
@@ -167,22 +195,35 @@ class VideoQADataset(Dataset):
         ans_word = ['[CLS] ' + qns_word + ' [SEP] ' + str(cand_ans[i]) for i in range(self.mc)]
         
         # Load video features
-        # Appearance feature: (T, D) e.g., (16, 2048)
         app_feat = self.app_feats[vid]
-        # Motion feature: (T, D) e.g., (16, 2048)  
         mot_feat = self.mot_feats[vid]
         
-        # Frame feature: concatenate app + mot -> (T, D*2) = (16, 4096)
-        # Hoặc có thể average/stack tùy theo cách model xử lý
-        # Ở đây ta concatenate để có đủ thông tin
-        frame_feat = np.concatenate([app_feat, mot_feat], axis=-1)  # (T, 4096)
+        # Handle different feature shapes
+        # app_feat could be (T, D) or (T, N, D) where N is number of clips
+        # mot_feat could be (T, D) or (T, N, D)
+        
+        # Squeeze or reshape if needed to get (T, D)
+        if app_feat.ndim == 3:
+            # Shape is (T, N, D) - take mean over N or reshape
+            app_feat = app_feat.mean(axis=1) if app_feat.shape[1] > 1 else app_feat.squeeze(1)
+        if mot_feat.ndim == 3:
+            mot_feat = mot_feat.mean(axis=1) if mot_feat.shape[1] > 1 else mot_feat.squeeze(1)
+        
+        # Ensure both have same shape
+        if app_feat.ndim == 1:
+            app_feat = app_feat[np.newaxis, :]  # (1, D)
+        if mot_feat.ndim == 1:
+            mot_feat = mot_feat[np.newaxis, :]  # (1, D)
+        
+        # Frame feature: concatenate app + mot -> (T, D*2)
+        frame_feat = np.concatenate([app_feat, mot_feat], axis=-1)
         vid_frame_feat = torch.from_numpy(frame_feat).type(torch.float32)
         
         # Object features - CausalVidQA không có region features riêng
         # Ta dùng appearance features làm "object" features với dummy bbox
         # Shape expected by model: (F, O, 2053) where F=frames, O=objects
         T = app_feat.shape[0]
-        D_obj = app_feat.shape[1]  # 2048
+        D_obj = app_feat.shape[-1]  # 2048
         
         # Tạo object feature: (T, obj_num, 2048)
         # Replicate frame feature cho mỗi object slot
