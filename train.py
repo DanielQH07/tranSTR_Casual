@@ -72,6 +72,9 @@ parser.add_argument("-pos_ratio", "-pr", type=float, help="postive ratio of fg t
 parser.add_argument("-neg_ratio", "-nr", type=float, help="negtive ratio of fg token in trans decoder", default=0.3) 
 parser.add_argument("-a", type=float, action="store", help="NCE loss multiplier", default=1) 
 
+# AMP setting (disable for DeBERTa FP16 issues)
+parser.add_argument("--use_amp", action="store_true", help="Use mixed precision training (default: False)")
+parser.add_argument("--num_workers", type=int, default=8, help="Number of dataloader workers")
 
 args = parser.parse_args()
 set_gpu_devices(args.gpu)
@@ -92,7 +95,7 @@ np.set_printoptions(edgeitems=30, linewidth=30, formatter=dict(float=lambda x: "
 # torch.autograd.set_detect_anomaly(True)
 
 
-def train(model, optimizer, train_loader, xe, device):
+def train(model, optimizer, train_loader, xe, device, use_amp=True):
     model.train()
     total_step = len(train_loader)
     epoch_loss = 0.0
@@ -105,7 +108,7 @@ def train(model, optimizer, train_loader, xe, device):
         vid_frame_feat = vid_frame_inputs.to(device)
         vid_obj_feat = vid_obj_inputs.to(device)
         ans_targets = ans_id.to(device)
-        with torch.cuda.amp.autocast(enabled=True):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             out_f = model( vid_frame_feat, vid_obj_feat, qns_w, ans_w)
             loss = xe(out_f, ans_targets)
         optimizer.zero_grad()
@@ -218,9 +221,9 @@ if __name__ == "__main__":
         max_samples=args.max_samples
     )
 
-    train_loader = DataLoader(dataset=train_dataset,batch_size=args.bs,shuffle=True,num_workers=8,pin_memory=True, prefetch_factor=4)
-    val_loader = DataLoader(dataset=val_dataset,batch_size=args.bs,shuffle=False,num_workers=8,pin_memory=True, prefetch_factor=4)
-    test_loader = DataLoader(dataset=test_dataset,batch_size=args.bs,shuffle=False,num_workers=8,pin_memory=True, prefetch_factor=4)
+    train_loader = DataLoader(dataset=train_dataset,batch_size=args.bs,shuffle=True,num_workers=args.num_workers,pin_memory=True)
+    val_loader = DataLoader(dataset=val_dataset,batch_size=args.bs,shuffle=False,num_workers=args.num_workers,pin_memory=True)
+    test_loader = DataLoader(dataset=test_dataset,batch_size=args.bs,shuffle=False,num_workers=args.num_workers,pin_memory=True)
 
     # hyper setting
     epoch_num = args.epoch
@@ -238,13 +241,13 @@ if __name__ == "__main__":
     model.to(device)
     xe = nn.CrossEntropyLoss().to(device)
     # Creates a GradScaler once at the beginning of training.
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scaler = torch.amp.GradScaler('cuda', enabled=args.use_amp)
 
     # train & val
     best_eval_score = 0.0
     best_epoch=1
     for epoch in range(1, epoch_num+1):
-        train_loss, train_acc = train(model, optimizer, train_loader, xe, device)
+        train_loss, train_acc = train(model, optimizer, train_loader, xe, device, use_amp=args.use_amp)
         eval_score = eval(model, val_loader, device)
         scheduler.step(eval_score)
         if eval_score > best_eval_score :
