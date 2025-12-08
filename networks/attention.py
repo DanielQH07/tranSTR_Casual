@@ -59,8 +59,13 @@ class MultiheadAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(2, 3))  # (bs, n_heads, q_length, k_length)
         scores_ = scores.mean(1)
         if key_padding_mask is not None:
-            key_padding_mask = ((~key_padding_mask).view(mask_reshp).expand_as(scores))  # (bs, n_heads, q_length, k_length)
-            scores=scores.masked_fill(key_padding_mask, -float("inf"))  # (bs, n_heads, q_length, k_length)
+            # Ensure padding mask aligns with current key length (DataParallel can pass
+            # longer masks than the local slice). Trim and reshape safely.
+            if key_padding_mask.size(1) > k_length:
+                key_padding_mask = key_padding_mask[:, :k_length]
+            key_padding_mask = key_padding_mask.reshape(bs, k_length)
+            padding_mask = (~key_padding_mask).view(mask_reshp).expand_as(scores)  # (bs, n_heads, q_length, k_length)
+            scores = scores.masked_fill(padding_mask, -float("inf"))  # (bs, n_heads, q_length, k_length)
 
         weights = nn.Softmax(dim=-1)(scores)  # (bs, n_heads, q_length, k_length)
         weights = self.dropout(weights)  # (bs, n_heads, q_length, k_length)
