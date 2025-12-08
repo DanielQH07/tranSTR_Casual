@@ -59,12 +59,29 @@ class MultiheadAttention(nn.Module):
         scores = torch.matmul(q, k.transpose(2, 3))  # (bs, n_heads, q_length, k_length)
         scores_ = scores.mean(1)
         if key_padding_mask is not None:
-            # Ensure padding mask aligns with current key length (DataParallel can pass
-            # longer masks than the local slice). Trim and reshape safely.
-            if key_padding_mask.size(1) > k_length:
+            # Handle DataParallel: mask batch size may differ from local bs
+            # Get actual mask batch size and reshape accordingly
+            mask_bs = key_padding_mask.size(0)
+            mask_len = key_padding_mask.size(1)
+            
+            # Ensure mask batch size matches scores batch size
+            if mask_bs != bs:
+                # This can happen with DataParallel - use actual batch from scores
+                bs = mask_bs
+            
+            # Trim mask to k_length if needed
+            if mask_len > k_length:
                 key_padding_mask = key_padding_mask[:, :k_length]
-            key_padding_mask = key_padding_mask.reshape(bs, k_length)
-            padding_mask = (~key_padding_mask).view(mask_reshp).expand_as(scores)  # (bs, n_heads, q_length, k_length)
+                mask_len = k_length
+            elif mask_len < k_length:
+                # Pad mask if it's shorter than k_length
+                padding = torch.ones(mask_bs, k_length - mask_len, dtype=key_padding_mask.dtype, device=key_padding_mask.device)
+                key_padding_mask = torch.cat([key_padding_mask, padding], dim=1)
+                mask_len = k_length
+            
+            # Reshape mask to match actual batch dimension
+            mask_reshp_actual = (bs, 1, 1, mask_len)
+            padding_mask = (~key_padding_mask).view(mask_reshp_actual).expand_as(scores)  # (bs, n_heads, q_length, k_length)
             scores = scores.masked_fill(padding_mask, -float("inf"))  # (bs, n_heads, q_length, k_length)
 
         weights = nn.Softmax(dim=-1)(scores)  # (bs, n_heads, q_length, k_length)

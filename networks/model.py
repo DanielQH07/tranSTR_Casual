@@ -119,9 +119,14 @@ class VideoQAmodel(nn.Module):
         # obj
         obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
         obj_local = self.obj_resize(obj_feat)
+        
+        # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
+        q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
+        q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0) if q_mask is not None else None
+        
         obj_local, obj_att = self.obj_decoder(obj_local.flatten(0,1),
-                                            q_local.repeat_interleave(self.frame_topK, dim=0), 
-                                            memory_key_padding_mask=q_mask.repeat_interleave(self.frame_topK, dim=0),
+                                            q_local_repeated, 
+                                            memory_key_padding_mask=q_mask_repeated,
                                             output_attentions=True
                                             )  # b*16,5,d        #.view(B, F, O, -1) # b,16,5,d
 
