@@ -13,26 +13,15 @@ from transformers import RobertaTokenizerFast
 
 class VideoQADataset(Dataset):
     """
-    DataLoader cho CausalVidQA với output format tương thích NextQA
-    
+    DataLoader for CausalVidQA, single-GPU compatible.
     Output format: (vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key)
-    - vid_frame_feat: (T, D) - concatenate appearance + motion features
-    - vid_obj_feat: (T*2, obj_num, D) - object features flattened
-    - qns_word: question text
-    - ans_word: list of "[CLS] question [SEP] answer_i" for each candidate
-    - ans_id: ground truth answer index
-    - qns_key: video_id + "_" + qtype
+    vid_frame_feat is (T, D) concatenate appearance and motion features
+    vid_obj_feat is (T, obj_num, D) object features
+    qns_word is the question text
+    ans_word is a list of [CLS] question [SEP] answer_i for each candidate
+    ans_id is the ground truth answer index
+    qns_key is video_id plus qtype
     """
-        """
-        DataLoader for CausalVidQA, single-GPU compatible.
-        Output format: (vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key)
-        - vid_frame_feat: (T, D) - concatenate appearance + motion features
-        - vid_obj_feat: (T, obj_num, D) - object features
-        - qns_word: question text
-        - ans_word: list of "[CLS] question [SEP] answer_i" for each candidate
-        - ans_id: ground truth answer index
-        - qns_key: video_id + "_" + qtype
-        """
     
     def __init__(self, split, n_query=5, obj_num=1, 
                  sample_list_path=None,  # Path to split pkl files (dataset-split-1)

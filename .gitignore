@@ -1,0 +1,4 @@
+.history
+*.log
+*.tmp
+.DS_Store
