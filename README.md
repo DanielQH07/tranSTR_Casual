@@ -32,14 +32,14 @@
 | 4 | **Counterfactual Answer** | Kết quả giả định | "What would happen if...?" |
 | 5 | **Counterfactual Reason** | Lý do giả định | "Why would that happen?" |
 
-### Visual Features
+### Visual Features (what the code actually uses)
 
-| Feature | Shape | Mô tả |
-|---------|-------|-------|
-| Appearance | `(T, 2048)` hoặc `(T, N, 2048)` | ResNet-101 features |
-| Motion | `(T, 2048)` | 3D ResNet features |
-| Frame (combined) | `(T, 4096)` | app + mot concatenated |
-| Object | `(T, O, 2053)` | 2048 feat + 5 bbox coords |
+| Tensor | Shape | Produced from |
+|--------|-------|---------------|
+| Appearance | `(T, 2048)` or `(T, N, 2048)` | `appearance_feat.h5` (ResNet-101), mean over N if present |
+| Motion | `(T, 2048)` or `(T, N, 2048)` | `motion_feat.h5` (3D ResNet), mean over N if present |
+| Frame (combined) | `(T, 4096)` | concat(appearance, motion) |
+| “Object” | `(T, O, 2053)` | appearance tiled O times + dummy full-frame bbox (no detector) |
 
 ---
 
@@ -65,6 +65,50 @@ kaggle-input/
     ├── valid.pkl             # List[video_id] cho validation  
     └── test.pkl              # List[video_id] cho testing
 ```
+
+---
+
+## 🔄 End-to-end flow (what the current code does)
+
+1) **Inputs on disk**
+   - `appearance_feat.h5`, `motion_feat.h5`, `idx2vid.pkl`
+   - `text-annotation/QA/<video_id>/{text.json, answer.json}`
+   - Split files `{train,valid/test,test}.pkl`
+
+2) **Dataset construction (`VideoQADataset` in `DataLoader.py`)**
+   - Load video IDs from split pkl (optionally truncated by `max_samples`).
+   - Map video IDs → feature indices via `idx2vid.pkl`.
+   - Load appearance and motion features for the videos; if a 3rd dim exists, mean-pool over it.
+   - Build sample list by `qtype`:
+     - `-1`: all qtypes 0–5
+     - `0` or `1`: single type
+     - `2`: predictive answer + predictive reason (2,3)
+     - `3`: counterfactual answer + counterfactual reason (4,5)  ⚠️ naming quirk
+   - For each sample: load question/answers from `text.json` + labels from `answer.json`.
+
+3) **Feature preparation (per sample)**
+   - Frame feature: concat appearance + motion → `(T, 4096)`.
+   - “Object” feature: tile appearance to `(T, O, 2048)`, append dummy bbox `[0,0,1,1,1]` → `(T, O, 2053)`.  
+     *No object detector is run; boxes are full-frame placeholders.*
+   - Answers are formatted as `[CLS] question [SEP] candidate_i`.
+   - Outputs per item: `(vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key)`.
+
+4) **Dataloaders**
+   - `train/val/test` loaders with given batch size, optional workers; `pin_memory=True`.
+
+5) **Model (`networks/model.py`)**
+   - Encodes video features and text; uses transformer decoder for answer scoring.
+   - Expects both frame and “object” tensors even though objects are synthesized as above.
+
+6) **Training loop (`transtr.ipynb`)**
+   - Supports gradient accumulation, LR scheduling, early stopping, W&B logging.
+   - Tracks per-qtype accuracy and wrong samples.
+
+7) **Evaluation / prediction**
+   - Best checkpoint evaluated on test loader.
+   - Predictions saved to JSON; per-qtype metrics computed; wrong samples logged/saved.
+
+---
 
 ### Text Annotation Format
 

@@ -1,305 +1,243 @@
 import torch
 import os
+import re
+import pickle as pkl
 import h5py
 import os.path as osp
 import numpy as np
-import json
-import pickle as pkl
 from torch.utils import data
-from utils.util import load_file, pause, transform_bb, pkload
+from utils.util import load_file, pause, transform_bb
 from torch.utils.data import Dataset, DataLoader
 from transformers import RobertaTokenizerFast
 
-
 class VideoQADataset(Dataset):
-    """
-    DataLoader for CausalVidQA, single-GPU compatible.
-    Output format: (vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key)
-    vid_frame_feat is (T, D) concatenate appearance and motion features
-    vid_obj_feat is (T, obj_num, D) object features
-    qns_word is the question text
-    ans_word is a list of [CLS] question [SEP] answer_i for each candidate
-    ans_id is the ground truth answer index
-    qns_key is video_id plus qtype
-    """
-    
-    def __init__(self, split, n_query=5, obj_num=1, 
-                 sample_list_path=None,  # Path to split pkl files (dataset-split-1)
-                 video_feature_path=None,  # Path to visual features
-                 text_annotation_path=None,  # Path to text annotations (text.json, answer.json)
-                 qtype=-1,  # Question type: -1 for all, 0-5 for specific
-                 max_samples=None):  # Limit number of videos for quick testing
+    def __init__(self, split, n_query=5, obj_num=1, sample_list_path="/data/vqa/causal/anno",\
+         video_feature_path="/region_feat_aln", object_feature_path="/object_feat", split_dir=None):
         super(VideoQADataset, self).__init__()
-        
+        # 读取dataset
+        self.sample_list_file = osp.join(sample_list_path, "{}.csv".format(split))
+        self.sample_list = load_file(self.sample_list_file)
         self.split = split
-        self.mc = n_query  # Number of answer choices (5 for CausalVidQA)
+        self.mc = n_query
         self.obj_num = obj_num
-        self.qtype = qtype
+        
+        # Paths
         self.video_feature_path = video_feature_path
-        self.text_annotation_path = text_annotation_path
-        self.max_samples = max_samples
+        self.object_feature_path = object_feature_path
         
-        # Load video ids for this split
-        # Handle different naming conventions: val.pkl vs valid.pkl
-        split_name = split
-        if split == 'val':
-            # Try val.pkl first, then valid.pkl
-            split_file = osp.join(sample_list_path, 'val.pkl')
-            if not osp.exists(split_file):
-                split_file = osp.join(sample_list_path, 'valid.pkl')
-        else:
-            split_file = osp.join(sample_list_path, f'{split}.pkl')
+        print(f"Loading {split} dataset from {self.sample_list_file}...")
+        initial_len = len(self.sample_list)
         
-        if not osp.exists(split_file):
-            raise FileNotFoundError(f"Split file not found: {split_file}")
-        
-        self.vids = pkload(split_file)
-        
-        if self.vids is None:
-            raise ValueError(f"Failed to load split file: {split_file}")
-        
-        # Limit number of videos if max_samples is set
-        if max_samples is not None and max_samples > 0:
-            self.vids = self.vids[:max_samples]
-            print(f"Limited to {len(self.vids)} videos (max_samples={max_samples})")
-        else:
-            print(f"Loaded {len(self.vids)} videos from {split_file}")
-        
-        # Load video feature index mapping
-        idx2vid_file = osp.join(video_feature_path, 'idx2vid.pkl')
-        vf_info = pkload(idx2vid_file)
-        self.vf_info = dict()
-        for idx, vid in enumerate(vf_info):
-            if vid in self.vids:
-                self.vf_info[vid] = idx
-        
-        # Load appearance features
-        app_file = osp.join(video_feature_path, 'appearance_feat.h5')
-        print(f'Loading {app_file}...')
-        self.app_feats = dict()
-        with h5py.File(app_file, 'r') as fp:
-            feats = fp['resnet_features']
-            for vid, idx in self.vf_info.items():
-                self.app_feats[vid] = feats[idx][...]
-        
-        # Load motion features
-        mot_file = osp.join(video_feature_path, 'motion_feat.h5')
-        print(f'Loading {mot_file}...')
-        self.mot_feats = dict()
-        with h5py.File(mot_file, 'r') as fp:
-            feats = fp['resnet_features']
-            for vid, idx in self.vf_info.items():
-                self.mot_feats[vid] = feats[idx][...]
-        
-        # Build sample list based on qtype
-        self._build_sample_list()
+        # 1. Filter by TXT split file (if provided)
+        if split_dir is not None:
+            # Map 'val' to 'valid' if necessary for the txt filename
+            txt_name = 'valid' if split == 'val' else split
+            txt_path = osp.join(split_dir, f"{txt_name}.txt")
+            
+            if osp.exists(txt_path):
+                print(f"Filtering by split file: {txt_path}")
+                with open(txt_path, 'r') as f:
+                    valid_vids = set(line.strip() for line in f)
+                # Ensure string comparison
+                self.sample_list = self.sample_list[self.sample_list['video_id'].astype(str).isin(valid_vids)]
+                print(f"  - Samples after split filter: {len(self.sample_list)} (dropped {initial_len - len(self.sample_list)})")
+            else:
+                print(f"Warning: Split file {txt_path} not found. Skipping split filtering.")
 
-    def _build_sample_list(self):
-        """Build list of (video_id, qtype) samples based on qtype setting"""
-        self.samples = []
+        # 2. Filter by Feature File Existence
+        # Optimize: Check unique videos only
+        unique_vids = self.sample_list['video_id'].unique()
+        existing_vids = []
+        missing_count = 0
         
-        # Question types in CausalVidQA:
-        # 0: descriptive
-        # 1: explanatory
-        # 2: predictive answer
-        # 3: predictive reason
-        # 4: counterfactual answer
-        # 5: counterfactual reason
-        
-        if self.qtype == -1:
-            # All question types
-            for vid in self.vids:
-                for qt in range(6):
-                    self.samples.append((vid, qt))
-        elif self.qtype == 0 or self.qtype == 1:
-            # Single question type
-            for vid in self.vids:
-                self.samples.append((vid, self.qtype))
-        elif self.qtype == 2:
-            # Predictive (answer + reason)
-            for vid in self.vids:
-                self.samples.append((vid, 2))
-                self.samples.append((vid, 3))
-        elif self.qtype == 3:
-            # Counterfactual (answer + reason)
-            for vid in self.vids:
-                self.samples.append((vid, 4))
-                self.samples.append((vid, 5))
-        else:
-            for vid in self.vids:
-                self.samples.append((vid, self.qtype))
-        
-        print(f"Total samples: {len(self.samples)}")
+        for vid in unique_vids:
+            vid_str = str(vid)
+            # Check ViT feature: video_feature_path/{split}/{vid}.pt
+            feat_file = osp.join(self.video_feature_path, self.split, f"{vid_str}.pt")
+            
+            # Optional: Strict check for object folder
+            # obj_dir = osp.join(self.object_feature_path, vid_str)
+            # if osp.exists(feat_file) and osp.isdir(obj_dir):
+            
+            if osp.exists(feat_file):
+                existing_vids.append(vid)
+            else:
+                missing_count += 1
+                if missing_count <= 5: # Debug print first few missing
+                    print(f"  [Missing Feat] {feat_file}")
 
-    def _load_text(self, vid, qtype):
-        """Load question, candidate answers, and ground truth from text annotations"""
-        # Try different folder structures
-        # Structure 1: text_annotation_path/vid/text.json
-        # Structure 2: text_annotation_path/QA/vid/text.json
-        text_file = osp.join(self.text_annotation_path, vid, 'text.json')
-        answer_file = osp.join(self.text_annotation_path, vid, 'answer.json')
+        if missing_count > 0:
+            print(f"  - Missing features for {missing_count} videos.")
         
-        # If not found, try with QA subfolder
-        if not osp.exists(text_file):
-            text_file = osp.join(self.text_annotation_path, 'QA', vid, 'text.json')
-            answer_file = osp.join(self.text_annotation_path, 'QA', vid, 'answer.json')
-        
-        if not osp.exists(text_file):
-            raise FileNotFoundError(f"Text annotation not found for video: {vid}\n"
-                                    f"Tried: {osp.join(self.text_annotation_path, vid, 'text.json')}\n"
-                                    f"And: {osp.join(self.text_annotation_path, 'QA', vid, 'text.json')}")
-        
-        with open(text_file, 'r') as f:
-            text = json.load(f)
-        with open(answer_file, 'r') as f:
-            answer = json.load(f)
-        
-        if qtype == 0:
-            qns = text['descriptive']['question']
-            cand_ans = text['descriptive']['answer']
-            ans_id = answer['descriptive']['answer']
-        elif qtype == 1:
-            qns = text['explanatory']['question']
-            cand_ans = text['explanatory']['answer']
-            ans_id = answer['explanatory']['answer']
-        elif qtype == 2:
-            qns = text['predictive']['question']
-            cand_ans = text['predictive']['answer']
-            ans_id = answer['predictive']['answer']
-        elif qtype == 3:
-            qns = text['predictive']['question']
-            cand_ans = text['predictive']['reason']
-            ans_id = answer['predictive']['reason']
-        elif qtype == 4:
-            qns = text['counterfactual']['question']
-            cand_ans = text['counterfactual']['answer']
-            ans_id = answer['counterfactual']['answer']
-        elif qtype == 5:
-            qns = text['counterfactual']['question']
-            cand_ans = text['counterfactual']['reason']
-            ans_id = answer['counterfactual']['reason']
-        else:
-            raise ValueError(f"Invalid qtype: {qtype}")
-        
-        return qns, cand_ans, ans_id
+        existing_vids_set = set(existing_vids)
+        prev_len = len(self.sample_list)
+        self.sample_list = self.sample_list[self.sample_list['video_id'].isin(existing_vids_set)]
+        print(f"  - Final samples after feature check: {len(self.sample_list)} (dropped {prev_len - len(self.sample_list)})")
 
 
     def __getitem__(self, idx):
-        vid, qtype = self.samples[idx]
+        cur_sample = self.sample_list.iloc[idx]
+        width, height = cur_sample['width'], cur_sample['height']
+        video_name = str(cur_sample["video_id"])
+        qns_word = str(cur_sample["question"])
+        ans_id = self.find_answer_num(cur_sample)
+        ans_word = ['[CLS] ' + qns_word+' [SEP] '+ str(cur_sample["a" + str(i)]) for i in range(self.mc)]
         
-        # Load text data
-        qns_word, cand_ans, ans_id = self._load_text(vid, qtype)
+        # 1. Load Frame Features
+        frame_feat_file = osp.join(self.video_feature_path, self.split, f"{video_name}.pt")
+        vid_frame_feat = torch.load(frame_feat_file)
+        if isinstance(vid_frame_feat, np.ndarray):
+            vid_frame_feat = torch.from_numpy(vid_frame_feat)
+        vid_frame_feat = vid_frame_feat.type(torch.float32)
+
+        # 2. Load Object Features (Folder of PKL files)
+        obj_dir = osp.join(self.object_feature_path, video_name)
         
-        # Format answer words like NextQA: "[CLS] question [SEP] answer"
-        ans_word = ['[CLS] ' + qns_word + ' [SEP] ' + str(cand_ans[i]) for i in range(self.mc)]
+        # Helper to extract frame number for sorting
+        def extract_number(f):
+            s = re.findall(r'\d+', f)
+            return int(s[-1]) if s else -1
+
+        frame_obj_feats = []
         
-        # Load video features
-        app_feat = self.app_feats[vid]
-        mot_feat = self.mot_feats[vid]
+        if osp.isdir(obj_dir):
+            # List all pkl files, ignoring hidden/metadata files (starting with ._)
+            files = [f for f in os.listdir(obj_dir) if f.endswith('.pkl') and not f.startswith('._')]
+            # Sort by frame number
+            files.sort(key=extract_number)
+            
+            for f in files:
+                f_path = osp.join(obj_dir, f)
+                try:
+                    with open(f_path, 'rb') as fp:
+                        content = pkl.load(fp)
+                        
+                    # Assume content structure based on user description + typical format
+                    # If it's the box/feature content directly
+                    roi_feat = None
+                    roi_bbox = None
+                    
+                    if isinstance(content, dict):
+                        # Standard format check
+                        if any(k in content for k in ['feat', 'features', 'bbox', 'boxes', 'box']):
+                            roi_feat = content.get('feat', content.get('features'))
+                            roi_bbox = content.get('bbox', content.get('boxes', content.get('box')))
+                        else:
+                            # User Format: {'person_1': [x1, y1, x2, y2], ...} with relative coordinates
+                            boxes_list = []
+                            for k, v in content.items():
+                                if isinstance(v, (list, tuple, np.ndarray)) and len(v) == 4:
+                                    # Denormalize relative coordinates to absolute pixels
+                                    # as transform_bb expects absolute coordinates
+                                    # box is [x1, y1, x2, y2]
+                                    abs_box = [
+                                        float(v[0]) * width,
+                                        float(v[1]) * height,
+                                        float(v[2]) * width,
+                                        float(v[3]) * height
+                                    ]
+                                    boxes_list.append(abs_box)
+                            
+                            if boxes_list:
+                                roi_bbox = np.array(boxes_list)
+                                roi_feat = None # Will trigger zero-init below
+                            else:
+                                roi_bbox = None
+                                roi_feat = None
+
+                    elif isinstance(content, (list, tuple)) and len(content) >= 2:
+                        roi_feat, roi_bbox = content[0], content[1]
+                    else:
+                        # Fallback: maybe just features or just boxes?
+                        # User said "chứa object box" (contains object box).
+                        # We need features (2048) + bbox (4/5) usually.
+                        # If only box is present, we might mock features or this assumption is wrong.
+                        # Let's assume content is the data we need.
+                        # Use placeholder if feature extraction fails.
+                        pass
+
+                    # Logic to handle missing features if user only provided boxes? 
+                    # Assuming we have valid data for now, similar to previous logic.
+                    if roi_feat is None and roi_bbox is not None:
+                        # Generate dummy features if only boxes exist (unlikely for TranSTR but possible)
+                        roi_feat = torch.zeros((len(roi_bbox), 2048))
+                    
+                    if roi_feat is not None and roi_bbox is not None:
+                        # Convert to torch
+                        if isinstance(roi_feat, np.ndarray): roi_feat = torch.from_numpy(roi_feat)
+                        if isinstance(roi_bbox, np.ndarray): roi_bbox = torch.from_numpy(roi_bbox)
+                        
+                        # Limit number of objects
+                        if roi_feat.shape[0] > self.obj_num:
+                            roi_feat = roi_feat[:self.obj_num]
+                            roi_bbox = roi_bbox[:self.obj_num]
+                            
+                        # Transform BBox
+                        bbox_feat = transform_bb(roi_bbox.numpy(), width, height)
+                        bbox_feat = torch.from_numpy(bbox_feat).type(torch.float32)
+                        roi_feat = roi_feat.type(torch.float32)
+                        
+                        # Concat
+                        # Shape: (Obj_Num, 2048+5)
+                        obj_feat_step = torch.cat((roi_feat, bbox_feat), dim=-1)
+                        frame_obj_feats.append(obj_feat_step)
+                        
+                except Exception as e:
+                    print(f"Error loading {f_path}: {e}")
+                    continue
         
-        # Handle different feature shapes
-        # app_feat could be (T, D) or (T, N, D) where N is number of clips
-        # mot_feat could be (T, D) or (T, N, D)
-        
-        # Squeeze or reshape if needed to get (T, D)
-        if app_feat.ndim == 3:
-            # Shape is (T, N, D) - take mean over N or reshape
-            app_feat = app_feat.mean(axis=1) if app_feat.shape[1] > 1 else app_feat.squeeze(1)
-        if mot_feat.ndim == 3:
-            mot_feat = mot_feat.mean(axis=1) if mot_feat.shape[1] > 1 else mot_feat.squeeze(1)
-        
-        # Ensure both have same shape
-        if app_feat.ndim == 1:
-            app_feat = app_feat[np.newaxis, :]  # (1, D)
-        if mot_feat.ndim == 1:
-            mot_feat = mot_feat[np.newaxis, :]  # (1, D)
-        
-        # Frame feature: concatenate app + mot -> (T, D*2)
-        frame_feat = np.concatenate([app_feat, mot_feat], axis=-1)
-        vid_frame_feat = torch.from_numpy(frame_feat).type(torch.float32)
-        
-        # Object features - CausalVidQA không có region features riêng
-        # Ta dùng appearance features làm "object" features với dummy bbox
-        # Shape expected by model: (F, O, 2053) where F=frames, O=objects
-        T = app_feat.shape[0]
-        D_obj = app_feat.shape[-1]  # 2048
-        
-        # Tạo object feature: (T, obj_num, 2048)
-        # Replicate frame feature cho mỗi object slot
-        obj_feat = np.tile(app_feat[:, np.newaxis, :], (1, self.obj_num, 1))  # (T, obj_num, 2048)
-        
-        # Add dummy bbox features (5 dims: x1, y1, x2, y2, area normalized)
-        # Shape: (T, obj_num, 5)
-        dummy_bbox = np.zeros((T, self.obj_num, 5), dtype=np.float32)
-        # Set some default values for bbox (normalized coordinates)
-        dummy_bbox[:, :, :4] = np.array([0.0, 0.0, 1.0, 1.0])  # full frame
-        dummy_bbox[:, :, 4] = 1.0  # area = 1 (full frame)
-        
-        # Concatenate: (T, obj_num, 2048+5=2053)
-        obj_feat = np.concatenate([obj_feat, dummy_bbox], axis=-1)
-        vid_obj_feat = torch.from_numpy(obj_feat).type(torch.float32)
-        
-        # Question key format
-        qns_key = vid + '_' + str(qtype)
-        
+        if len(frame_obj_feats) > 0:
+            vid_obj_feat = torch.stack(frame_obj_feats) # (Frames, Obj, Dim)
+            vid_obj_feat = vid_obj_feat.flatten(0, 1)   # (Frames*Obj, Dim)
+        else:
+            # Fallback
+            # print(f"Warning: No valid object features found for {video_name} in {obj_dir}")
+            vid_obj_feat = torch.zeros((vid_frame_feat.size(0) * self.obj_num, 2048 + 5))
+
+        qns_key = video_name + '_' + str(cur_sample["type"])
+
         return vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key
 
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.sample_list)
 
+    def find_answer_num(self, cur_sample):
+        # to find the answer num according to the given answer text
+        answer = str(cur_sample["answer"])  # this is the text of the answer
+        answer_list = []  # to store all the answer
+        for i in range(self.mc):
+            answer_list.append(str(cur_sample["a" + str(i)]))
+        # answer text match
+        for i in range(self.mc):
+            if (answer == answer_list[i]):
+                return int(i)
+        return None  # fail in matching
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="CausalVidQA DataLoader Test")
-    parser.add_argument('--split', default='val', type=str, choices=['train', 'val', 'test'])
-    parser.add_argument('--sample_list_path', type=str, required=True,
-                        help='Path to split pkl files (dataset-split-1)')
-    parser.add_argument('--video_feature_path', type=str, required=True,
-                        help='Path to visual features (appearance_feat.h5, motion_feat.h5)')
-    parser.add_argument('--text_annotation_path', type=str, required=True,
-                        help='Path to text annotations (folders with text.json, answer.json)')
-    parser.add_argument('--qtype', type=int, default=-1,
-                        help='Question type: -1 for all, 0-5 for specific')
-    parser.add_argument('--n_query', type=int, default=5, help='Number of answer choices')
-    parser.add_argument('--obj_num', type=int, default=1, help='Number of objects')
-    parser.add_argument('--batch_size', type=int, default=2)
+    parser = argparse.ArgumentParser(description="next logger")
+    parser.add_argument('-dataset', default='nextqa',choices=['nextqa'], type=str)
     args = parser.parse_args()
-    
-    # Example with kagglehub:
-    # import kagglehub
-    # args.sample_list_path = kagglehub.dataset_download('lusnaw/dataset-split-1')
-    # args.video_feature_path = kagglehub.dataset_download('lusnaw/visual-feature')
-    # args.text_annotation_path = kagglehub.dataset_download('lusnaw/text-annotation')
-    
-    train_dataset = VideoQADataset(
-        split=args.split,
-        n_query=args.n_query,
-        obj_num=args.obj_num,
-        sample_list_path=args.sample_list_path,
-        video_feature_path=args.video_feature_path,
-        text_annotation_path=args.text_annotation_path,
-        qtype=args.qtype
-    )
+    # video_feature_path = '/storage_fast/jbxiao/workspace/VideoQA/data/nextqa'
+    # sample_list_path = '/storage_fast/ycli/data/vqa/next/anno'
+    train_dataset=VideoQADataset('val', 5, 3)
 
-    train_loader = DataLoader(
-        dataset=train_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0
-    )
+    train_loader = DataLoader(dataset=train_dataset,batch_size=2,shuffle=False,num_workers=0)
 
     for sample in train_loader:
         vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key = sample
-        print("=" * 50)
-        print("Frame feat shape:", vid_frame_feat.size())
-        print("Object feat shape:", vid_obj_feat.size())
-        print("Question:", qns_word)
-        print("Answer choices:", ans_word)
-        print("Answer ID:", ans_id)
-        print("Question key:", qns_key)
-        print("=" * 50)
+        print("frame feat: ")
+        print(vid_frame_feat.size())
+        print("object feat: ")
+        print(vid_obj_feat.size())
+        print("qns_word: ")
+        print(qns_word)
+        print("ans_word")
+        print(ans_word)
+        print("ans id: ")
+        print(ans_id)
+        print("qns key: ")
+        print(qns_key)
         break
-    
-    print('Done!')
+    print('done')
