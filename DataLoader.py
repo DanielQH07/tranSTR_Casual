@@ -1,6 +1,8 @@
 import torch
 import os
 import re
+import json
+import pandas as pd
 import pickle as pkl
 import h5py
 import os.path as osp
@@ -11,280 +13,211 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import RobertaTokenizerFast
 
 class VideoQADataset(Dataset):
-    def __init__(self, split, n_query=5, obj_num=1, sample_list_path="/data/vqa/causal/anno",\
-         video_feature_path="/region_feat_aln", object_feature_path="/object_feat", split_dir=None):
+    def __init__(self, split, n_query=5, obj_num=10, sample_list_path="/data/vqa/causal/anno",\
+         video_feature_path="/region_feat_aln", object_feature_path="/object_feat", split_dir=None, topK_frame=20):
         super(VideoQADataset, self).__init__()
         # 读取dataset
-        # 1. Load / Discover Video IDs
         self.split = split
         self.mc = n_query
         self.obj_num = obj_num
         self.video_feature_path = video_feature_path
         self.object_feature_path = object_feature_path
+        self.topK_frame = topK_frame
 
-        # Determine valid video IDs based on Split Text Files
-        valid_vids = []
+        # 1. Load Split Video IDs
+        valid_vids = set()
         if split_dir is not None:
             txt_name = 'valid' if split == 'val' else split
             txt_path = osp.join(split_dir, f"{txt_name}.txt")
             if osp.exists(txt_path):
                 print(f"Loading split from: {txt_path}")
                 with open(txt_path, 'r') as f:
-                    valid_vids = [line.strip() for line in f if line.strip()]
+                    valid_vids = {line.strip() for line in f if line.strip()}
             else:
                 print(f"Warning: Split file {txt_path} not found.")
 
-        # 2. Parse JSON Annotations from folders
-        # Expected structure: sample_list_path / video_id / {text.json, answer.json}
+        # 2. Parse JSON Annotations
         data_rows = []
         
-        # If no split file provided, try to list directories in sample_list_path
+        # If no split file, scan the directory
         if not valid_vids and os.path.isdir(sample_list_path):
-            valid_vids = [d for d in os.listdir(sample_list_path) if os.path.isdir(os.path.join(sample_list_path, d))]
+             valid_vids = {d for d in os.listdir(sample_list_path) if os.path.isdir(os.path.join(sample_list_path, d))}
 
-        print(f"Parsing annotations for {len(valid_vids)} videos...")
-        
+        print(f"Scanning annotations for {len(valid_vids)} videos...")
         for vid in valid_vids:
             vid_path = osp.join(sample_list_path, vid)
-            text_json_path = osp.join(vid_path, 'text.json')
-            ans_json_path = osp.join(vid_path, 'answer.json')
-
-            if not (osp.exists(text_json_path) and osp.exists(ans_json_path)):
-                # print(f"Missing annotation files for {vid}")
-                continue
-
+            text_json = osp.join(vid_path, 'text.json')
+            ans_json = osp.join(vid_path, 'answer.json')
+            
+            if not(osp.exists(text_json) and osp.exists(ans_json)): continue
+            
             try:
-                # Load JSONs
-                with open(text_json_path, 'r', encoding='utf-8') as f:
-                    text_data = json.load(f)
-                with open(ans_json_path, 'r', encoding='utf-8') as f:
-                    ans_data = json.load(f)
-
-                # Helper to add row
-                def add_row(q_type, q_text, candidates, ans_idx, sub_type=None):
-                    if not candidates or ans_idx is None: return
-                    row = {
-                        'video_id': vid,
-                        'question': q_text,
-                        'answer': ans_idx, # Index 0-4
-                        'type': q_type if sub_type is None else f"{q_type}_{sub_type}",
-                        'width': 640, # Default/Dummy width
-                        'height': 480 # Default/Dummy height
-                    }
-                    # Add candidate columns a0..a4
-                    for i, cand in enumerate(candidates):
-                        row[f"a{i}"] = cand
-                    data_rows.append(row)
-
-                # Flatten the structure
-                # Root keys: descriptive, explanatory, predictive, counterfactual
+                with open(text_json, 'r', encoding='utf-8') as f: t_data = json.load(f)
+                with open(ans_json, 'r', encoding='utf-8') as f: a_data = json.load(f)
+                
+                # Check Qtypes
                 for key in ['descriptive', 'explanatory', 'predictive', 'counterfactual']:
-                    if key in text_data and key in ans_data:
-                        t_item = text_data[key]
-                        a_item = ans_data[key]
+                    if key in t_data and key in a_data:
+                        q_obj = t_data[key]
+                        a_obj = a_data[key]
                         
-                        # 1. Main Question
-                        # text: "question", "answer" (list)
-                        # answer: "answer" (int index)
-                        if 'question' in t_item and 'answer' in t_item and 'answer' in a_item:
-                            add_row(key, t_item['question'], t_item['answer'], a_item['answer'])
+                        # 1. Question Answer
+                        if 'question' in q_obj and 'answer' in q_obj and 'answer' in a_obj:
+                            row = {
+                                'video_id': vid,
+                                'question': q_obj['question'],
+                                'answer': a_obj['answer'], # index
+                                'type': key,
+                                'width': 640, 'height': 480 
+                            }
+                            # Candidates
+                            for i, cand in enumerate(q_obj['answer']):
+                                row[f"a{i}"] = cand
+                            data_rows.append(row)
                         
-                        # 2. Reasoning (for predictive/counterfactual)
-                        # User's JSON shows "reason" list in text and "reason" int in answer
-                        # But NO check for separate question text. 
-                        # We will skip creating a separate sample for reason to avoid duplicating the main question
-                        # unless generic "Why?" is appended, but that is risky without specific data.
-                        # Implementation: Only main Q&A pairs loaded for now.
+                        # 2. Reasoning (Predictive/Counterfactual)
+                        if key in ['predictive', 'counterfactual'] and 'reason' in q_obj and 'reason' in a_obj:
+                             # Create a separate sample for the reason
+                             # Question text: "Why?" (Implicit for CausalVidQA reasons)
+                             row_reason = {
+                                'video_id': vid,
+                                'question': "Why?",
+                                'answer': a_obj['reason'], # index
+                                'type': f"{key}_reason",
+                                'width': 640, 'height': 480 
+                            }
+                             for i, cand in enumerate(q_obj['reason']):
+                                row_reason[f"a{i}"] = cand
+                             data_rows.append(row_reason)
 
             except Exception as e:
                 print(f"Error parsing {vid}: {e}")
 
-        # Create DataFrame
         self.sample_list = pd.DataFrame(data_rows)
-        print(f"Loaded {len(self.sample_list)} questions from {len(valid_vids)} videos.")
+        print(f"Loaded {len(self.sample_list)} QA pairs.")
 
-        # 3. Filter by existing features (Logic preserved)
+        # 3. Filter by Video Feature Existence and Object Feature Existence
         initial_len = len(self.sample_list)
-        if initial_len == 0:
-            print("Warning: No samples loaded!")
-            return
-
-        unique_vids = self.sample_list['video_id'].unique()
-        existing_vids = set()
-        
-        for vid in unique_vids:
-            vid_str = str(vid)
-            feat_file = osp.join(self.video_feature_path, self.split, f"{vid_str}.pt")
-            if osp.exists(feat_file):
-                existing_vids.add(vid)
-        
-        self.sample_list = self.sample_list[self.sample_list['video_id'].isin(existing_vids)]
-        print(f"Final samples after feature check: {len(self.sample_list)} (dropped {initial_len - len(self.sample_list)})")
+        if initial_len > 0:
+            existing_vids = set()
+            unique_vids = self.sample_list['video_id'].unique()
+            for vid in unique_vids:
+                # Check Global Video Feat
+                vid_path = osp.join(self.video_feature_path, self.split, f"{vid}.pt")
+                if osp.exists(vid_path): 
+                    existing_vids.add(vid)
+                    
+            self.sample_list = self.sample_list[self.sample_list['video_id'].isin(existing_vids)]
+            print(f"Final dataset size: {len(self.sample_list)} (Dropped {initial_len - len(self.sample_list)})")
 
 
     def __getitem__(self, idx):
         cur_sample = self.sample_list.iloc[idx]
-        width, height = cur_sample['width'], cur_sample['height']
         video_name = str(cur_sample["video_id"])
         qns_word = str(cur_sample["question"])
-        ans_id = self.find_answer_num(cur_sample)
-        ans_word = ['[CLS] ' + qns_word+' [SEP] '+ str(cur_sample["a" + str(i)]) for i in range(self.mc)]
+        ans_id = int(cur_sample["answer"])
+        ans_word = ['[CLS] ' + qns_word+' [SEP] '+ str(cur_sample[f"a{i}"]) for i in range(self.mc)]
         
-        # 1. Load Frame Features
-        frame_feat_file = osp.join(self.video_feature_path, self.split, f"{video_name}.pt")
-        vid_frame_feat = torch.load(frame_feat_file)
-        if isinstance(vid_frame_feat, np.ndarray):
-            vid_frame_feat = torch.from_numpy(vid_frame_feat)
+        # 1. Load Video (Frame) Features
+        # These are pre-extracted ViT features, usually [Frames, 768]
+        frame_feat_path = osp.join(self.video_feature_path, self.split, f"{video_name}.pt")
+        vid_frame_feat = torch.load(frame_feat_path)
+        if isinstance(vid_frame_feat, np.ndarray): vid_frame_feat = torch.from_numpy(vid_frame_feat)
         vid_frame_feat = vid_frame_feat.type(torch.float32)
 
-        # 2. Load Object Features (Folder of PKL files)
+        # 2. Load Object Features (PKL Folder)
         obj_dir = osp.join(self.object_feature_path, video_name)
-        
-        # Helper to extract frame number for sorting
-        def extract_number(f):
-            s = re.findall(r'\d+', f)
-            return int(s[-1]) if s else -1
-
         frame_obj_feats = []
         
+        # Helper string sorter
+        def extract_number(f):
+             s = re.findall(r'\d+', f)
+             return int(s[-1]) if s else -1
+
         if osp.isdir(obj_dir):
-            # List all pkl files, ignoring hidden/metadata files (starting with ._)
-            files = [f for f in os.listdir(obj_dir) if f.endswith('.pkl') and not f.startswith('._')]
-            # Sort by frame number
-            files.sort(key=extract_number)
+            pkl_files = [f for f in os.listdir(obj_dir) if f.endswith('.pkl') and not f.startswith('._')]
+            pkl_files.sort(key=extract_number)
             
-            for f in files:
-                f_path = osp.join(obj_dir, f)
+            # --- FRAME SAMPLING LOGIC ---
+            num_files = len(pkl_files)
+            target_frames = self.topK_frame
+            indices = np.linspace(0, num_files - 1, target_frames).astype(int) if num_files > 0 else []
+            
+            for i in indices:
+                f_path = osp.join(obj_dir, pkl_files[i])
                 try:
-                    with open(f_path, 'rb') as fp:
-                        content = pkl.load(fp)
-                        
-                    # Assume content structure based on user description + typical format
-                    # If it's the box/feature content directly
-                    roi_feat = None
-                    roi_bbox = None
+                    with open(f_path, 'rb') as fp: content = pkl.load(fp)
+                    
+                    # Content check: {'feat', 'bbox', 'img_w', 'img_h'}
+                    # Allow dict or tuple/list
+                    roi_feat, roi_bbox, w, h = None, None, 640, 480
                     
                     if isinstance(content, dict):
-                        # Standard format check
-                        if any(k in content for k in ['feat', 'features', 'bbox', 'boxes', 'box']):
-                            roi_feat = content.get('feat', content.get('features'))
-                            roi_bbox = content.get('bbox', content.get('boxes', content.get('box')))
-                        else:
-                            # User Format: {'person_1': [x1, y1, x2, y2], ...} with relative coordinates
-                            boxes_list = []
-                            for k, v in content.items():
-                                if isinstance(v, (list, tuple, np.ndarray)) and len(v) == 4:
-                                    # Denormalize relative coordinates to absolute pixels
-                                    # as transform_bb expects absolute coordinates
-                                    # box is [x1, y1, x2, y2]
-                                    abs_box = [
-                                        float(v[0]) * width,
-                                        float(v[1]) * height,
-                                        float(v[2]) * width,
-                                        float(v[3]) * height
-                                    ]
-                                    boxes_list.append(abs_box)
-                            
-                            if boxes_list:
-                                roi_bbox = np.array(boxes_list)
-                                roi_feat = None # Will trigger zero-init below
-                            else:
-                                roi_bbox = None
-                                roi_feat = None
-
-                    elif isinstance(content, (list, tuple)) and len(content) >= 2:
-                        roi_feat, roi_bbox = content[0], content[1]
-                    else:
-                        # Fallback: maybe just features or just boxes?
-                        # User said "chứa object box" (contains object box).
-                        # We need features (2048) + bbox (4/5) usually.
-                        # If only box is present, we might mock features or this assumption is wrong.
-                        # Let's assume content is the data we need.
-                        # Use placeholder if feature extraction fails.
-                        pass
-
-                    # Logic to handle missing features if user only provided boxes? 
-                    # Assuming we have valid data for now, similar to previous logic.
-                    if roi_feat is None and roi_bbox is not None:
-                        # Generate dummy features if only boxes exist (unlikely for TranSTR but possible)
-                        roi_feat = torch.zeros((len(roi_bbox), 2048))
+                        roi_feat = content.get('feat', content.get('features'))
+                        roi_bbox = content.get('bbox', content.get('boxes', content.get('box')))
+                        w = content.get('img_w', content.get('width', 640))
+                        h = content.get('img_h', content.get('height', 480))
+                    elif isinstance(content, (list, tuple)) and len(content) >= 4:
+                        roi_feat, roi_bbox, w, h = content[0], content[1], content[2], content[3]
                     
+                    # Process
                     if roi_feat is not None and roi_bbox is not None:
-                        # Convert to torch
                         if isinstance(roi_feat, np.ndarray): roi_feat = torch.from_numpy(roi_feat)
                         if isinstance(roi_bbox, np.ndarray): roi_bbox = torch.from_numpy(roi_bbox)
                         
-                        # Limit number of objects
+                        # Limit objects per frame
                         if roi_feat.shape[0] > self.obj_num:
                             roi_feat = roi_feat[:self.obj_num]
                             roi_bbox = roi_bbox[:self.obj_num]
-                            
-                        # Transform BBox
-                        bbox_feat = transform_bb(roi_bbox.numpy(), width, height)
+                        elif roi_feat.shape[0] < self.obj_num:
+                             # Pad objects if fewer than required
+                             pad_num = self.obj_num - roi_feat.shape[0]
+                             feat_pad = torch.zeros((pad_num, roi_feat.shape[1]), dtype=roi_feat.dtype)
+                             bbox_pad = torch.zeros((pad_num, roi_bbox.shape[1]), dtype=roi_bbox.dtype)
+                             roi_feat = torch.cat((roi_feat, feat_pad), dim=0)
+                             roi_bbox = torch.cat((roi_bbox, bbox_pad), dim=0)
+
+                        bbox_feat = transform_bb(roi_bbox.numpy(), w, h)
                         bbox_feat = torch.from_numpy(bbox_feat).type(torch.float32)
                         roi_feat = roi_feat.type(torch.float32)
                         
-                        # Concat
-                        # Shape: (Obj_Num, 2048+5)
+                        # Concat [Obj, 2048] + [Obj, 5] -> [Obj, 2053]
                         obj_feat_step = torch.cat((roi_feat, bbox_feat), dim=-1)
                         frame_obj_feats.append(obj_feat_step)
+                    else:
+                        # Missing data in pkl? Pad with zeros
+                        frame_obj_feats.append(torch.zeros((self.obj_num, 2048+5)))
                         
                 except Exception as e:
-                    print(f"Error loading {f_path}: {e}")
-                    continue
+                    # File load error -> Pad
+                    frame_obj_feats.append(torch.zeros((self.obj_num, 2048+5)))
         
-        if len(frame_obj_feats) > 0:
-            vid_obj_feat = torch.stack(frame_obj_feats) # (Frames, Obj, Dim)
-            vid_obj_feat = vid_obj_feat.flatten(0, 1)   # (Frames*Obj, Dim)
-        else:
-            # Fallback
-            # print(f"Warning: No valid object features found for {video_name} in {obj_dir}")
-            vid_obj_feat = torch.zeros((vid_frame_feat.size(0) * self.obj_num, 2048 + 5))
+        # Ensure exact length
+        if len(frame_obj_feats) == 0:
+             frame_obj_feats = [torch.zeros((self.obj_num, 2048+5)) for _ in range(self.topK_frame)]
+        elif len(frame_obj_feats) < self.topK_frame:
+            while len(frame_obj_feats) < self.topK_frame:
+                frame_obj_feats.append(torch.zeros((self.obj_num, 2048+5)))
+
+        vid_obj_feat = torch.stack(frame_obj_feats) # [frames, obj, 2053]
+        vid_obj_feat = vid_obj_feat.flatten(0, 1)   # [frames*obj, 2053]
 
         qns_key = video_name + '_' + str(cur_sample["type"])
-
         return vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key
-
 
     def __len__(self):
         return len(self.sample_list)
 
     def find_answer_num(self, cur_sample):
-        # We already stored the integer answer index in the dataframe during parsing
         return int(cur_sample["answer"])
-        answer_list = []  # to store all the answer
-        for i in range(self.mc):
-            answer_list.append(str(cur_sample["a" + str(i)]))
-        # answer text match
-        for i in range(self.mc):
-            if (answer == answer_list[i]):
-                return int(i)
-        return None  # fail in matching
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="next logger")
     parser.add_argument('-dataset', default='nextqa',choices=['nextqa'], type=str)
     args = parser.parse_args()
-    # video_feature_path = '/storage_fast/jbxiao/workspace/VideoQA/data/nextqa'
-    # sample_list_path = '/storage_fast/ycli/data/vqa/next/anno'
-    train_dataset=VideoQADataset('val', 5, 3)
-
-    train_loader = DataLoader(dataset=train_dataset,batch_size=2,shuffle=False,num_workers=0)
-
-    for sample in train_loader:
-        vid_frame_feat, vid_obj_feat, qns_word, ans_word, ans_id, qns_key = sample
-        print("frame feat: ")
-        print(vid_frame_feat.size())
-        print("object feat: ")
-        print(vid_obj_feat.size())
-        print("qns_word: ")
-        print(qns_word)
-        print("ans_word")
-        print(ans_word)
-        print("ans id: ")
-        print(ans_id)
-        print("qns key: ")
-        print(qns_key)
-        break
-    print('done')
+    
+    # Test Init
+    # train_dataset=VideoQADataset('val', 5, 3)
+    # train_loader = DataLoader(dataset=train_dataset,batch_size=2,shuffle=False,num_workers=0)
+    print("Main Block Test Done")
