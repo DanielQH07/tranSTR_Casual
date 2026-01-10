@@ -15,64 +15,111 @@ class VideoQADataset(Dataset):
          video_feature_path="/region_feat_aln", object_feature_path="/object_feat", split_dir=None):
         super(VideoQADataset, self).__init__()
         # 读取dataset
-        self.sample_list_file = osp.join(sample_list_path, "{}.csv".format(split))
-        self.sample_list = load_file(self.sample_list_file)
+        # 1. Load / Discover Video IDs
         self.split = split
         self.mc = n_query
         self.obj_num = obj_num
-        
-        # Paths
         self.video_feature_path = video_feature_path
         self.object_feature_path = object_feature_path
-        
-        print(f"Loading {split} dataset from {self.sample_list_file}...")
-        initial_len = len(self.sample_list)
-        
-        # 1. Filter by TXT split file (if provided)
+
+        # Determine valid video IDs based on Split Text Files
+        valid_vids = []
         if split_dir is not None:
-            # Map 'val' to 'valid' if necessary for the txt filename
             txt_name = 'valid' if split == 'val' else split
             txt_path = osp.join(split_dir, f"{txt_name}.txt")
-            
             if osp.exists(txt_path):
-                print(f"Filtering by split file: {txt_path}")
+                print(f"Loading split from: {txt_path}")
                 with open(txt_path, 'r') as f:
-                    valid_vids = set(line.strip() for line in f)
-                # Ensure string comparison
-                self.sample_list = self.sample_list[self.sample_list['video_id'].astype(str).isin(valid_vids)]
-                print(f"  - Samples after split filter: {len(self.sample_list)} (dropped {initial_len - len(self.sample_list)})")
+                    valid_vids = [line.strip() for line in f if line.strip()]
             else:
-                print(f"Warning: Split file {txt_path} not found. Skipping split filtering.")
+                print(f"Warning: Split file {txt_path} not found.")
 
-        # 2. Filter by Feature File Existence
-        # Optimize: Check unique videos only
+        # 2. Parse JSON Annotations from folders
+        # Expected structure: sample_list_path / video_id / {text.json, answer.json}
+        data_rows = []
+        
+        # If no split file provided, try to list directories in sample_list_path
+        if not valid_vids and os.path.isdir(sample_list_path):
+            valid_vids = [d for d in os.listdir(sample_list_path) if os.path.isdir(os.path.join(sample_list_path, d))]
+
+        print(f"Parsing annotations for {len(valid_vids)} videos...")
+        
+        for vid in valid_vids:
+            vid_path = osp.join(sample_list_path, vid)
+            text_json_path = osp.join(vid_path, 'text.json')
+            ans_json_path = osp.join(vid_path, 'answer.json')
+
+            if not (osp.exists(text_json_path) and osp.exists(ans_json_path)):
+                # print(f"Missing annotation files for {vid}")
+                continue
+
+            try:
+                # Load JSONs
+                with open(text_json_path, 'r', encoding='utf-8') as f:
+                    text_data = json.load(f)
+                with open(ans_json_path, 'r', encoding='utf-8') as f:
+                    ans_data = json.load(f)
+
+                # Helper to add row
+                def add_row(q_type, q_text, candidates, ans_idx, sub_type=None):
+                    if not candidates or ans_idx is None: return
+                    row = {
+                        'video_id': vid,
+                        'question': q_text,
+                        'answer': ans_idx, # Index 0-4
+                        'type': q_type if sub_type is None else f"{q_type}_{sub_type}",
+                        'width': 640, # Default/Dummy width
+                        'height': 480 # Default/Dummy height
+                    }
+                    # Add candidate columns a0..a4
+                    for i, cand in enumerate(candidates):
+                        row[f"a{i}"] = cand
+                    data_rows.append(row)
+
+                # Flatten the structure
+                # Root keys: descriptive, explanatory, predictive, counterfactual
+                for key in ['descriptive', 'explanatory', 'predictive', 'counterfactual']:
+                    if key in text_data and key in ans_data:
+                        t_item = text_data[key]
+                        a_item = ans_data[key]
+                        
+                        # 1. Main Question
+                        # text: "question", "answer" (list)
+                        # answer: "answer" (int index)
+                        if 'question' in t_item and 'answer' in t_item and 'answer' in a_item:
+                            add_row(key, t_item['question'], t_item['answer'], a_item['answer'])
+                        
+                        # 2. Reasoning (for predictive/counterfactual)
+                        # User's JSON shows "reason" list in text and "reason" int in answer
+                        # But NO check for separate question text. 
+                        # We will skip creating a separate sample for reason to avoid duplicating the main question
+                        # unless generic "Why?" is appended, but that is risky without specific data.
+                        # Implementation: Only main Q&A pairs loaded for now.
+
+            except Exception as e:
+                print(f"Error parsing {vid}: {e}")
+
+        # Create DataFrame
+        self.sample_list = pd.DataFrame(data_rows)
+        print(f"Loaded {len(self.sample_list)} questions from {len(valid_vids)} videos.")
+
+        # 3. Filter by existing features (Logic preserved)
+        initial_len = len(self.sample_list)
+        if initial_len == 0:
+            print("Warning: No samples loaded!")
+            return
+
         unique_vids = self.sample_list['video_id'].unique()
-        existing_vids = []
-        missing_count = 0
+        existing_vids = set()
         
         for vid in unique_vids:
             vid_str = str(vid)
-            # Check ViT feature: video_feature_path/{split}/{vid}.pt
             feat_file = osp.join(self.video_feature_path, self.split, f"{vid_str}.pt")
-            
-            # Optional: Strict check for object folder
-            # obj_dir = osp.join(self.object_feature_path, vid_str)
-            # if osp.exists(feat_file) and osp.isdir(obj_dir):
-            
             if osp.exists(feat_file):
-                existing_vids.append(vid)
-            else:
-                missing_count += 1
-                if missing_count <= 5: # Debug print first few missing
-                    print(f"  [Missing Feat] {feat_file}")
-
-        if missing_count > 0:
-            print(f"  - Missing features for {missing_count} videos.")
+                existing_vids.add(vid)
         
-        existing_vids_set = set(existing_vids)
-        prev_len = len(self.sample_list)
-        self.sample_list = self.sample_list[self.sample_list['video_id'].isin(existing_vids_set)]
-        print(f"  - Final samples after feature check: {len(self.sample_list)} (dropped {prev_len - len(self.sample_list)})")
+        self.sample_list = self.sample_list[self.sample_list['video_id'].isin(existing_vids)]
+        print(f"Final samples after feature check: {len(self.sample_list)} (dropped {initial_len - len(self.sample_list)})")
 
 
     def __getitem__(self, idx):
@@ -203,8 +250,8 @@ class VideoQADataset(Dataset):
         return len(self.sample_list)
 
     def find_answer_num(self, cur_sample):
-        # to find the answer num according to the given answer text
-        answer = str(cur_sample["answer"])  # this is the text of the answer
+        # We already stored the integer answer index in the dataframe during parsing
+        return int(cur_sample["answer"])
         answer_list = []  # to store all the answer
         for i in range(self.mc):
             answer_list.append(str(cur_sample["a" + str(i)]))
