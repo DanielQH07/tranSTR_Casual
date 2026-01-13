@@ -51,7 +51,10 @@ class VideoQAmodel(nn.Module):
             output_feat_size=self.d_model, 
             dropout=kwargs['dropout'])
 
-        self.frame_topK, self.obj_topK = topK_obj, topK_frame
+        self.frame_topK, self.obj_topK = topK_frame, topK_obj
+        
+        # Add text projection layer (BERT 768 -> d_model)
+        self.text_proj = nn.Linear(768, self.d_model)
         self.frame_sorter = PerturbedTopK(self.frame_topK)
         self.obj_sorter = PerturbedTopK(self.obj_topK)
 
@@ -179,6 +182,9 @@ class VideoQAmodel(nn.Module):
         tokenized_queries = tokenized_queries.to(device)
         with torch.inference_mode(mode=self.freeze_text_encoder):
             encoded_text = self.text_encoder(**tokenized_queries).last_hidden_state
+        
+        # Project text from 768 to d_model
+        encoded_text = self.text_proj(encoded_text)
 
         return encoded_text, tokenized_queries.attention_mask.bool()
     
