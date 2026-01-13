@@ -167,6 +167,94 @@ class VideoQAmodel(nn.Module):
         # predict
         out = self.classifier(out).squeeze(-1) # 这里squeeze是由于classifier会出来最后一维是1
         return out
+    
+    def forward_cached(self, frame_feat, obj_feat, text_feat):
+        """
+        Forward pass using pre-extracted text features (bypasses DeBERTa).
+        
+        :param frame_feat: [bs, T, frame_feat_dim]
+        :param obj_feat: [bs, T, O, obj_feat_dim]
+        :param text_feat: [bs, 5, 768] - pre-extracted [CLS] features from DeBERTa
+        """
+        B, F, O = obj_feat.size()[:3]
+        device = frame_feat.device
+        
+        # Resize frame features
+        frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
+        
+        # Project cached text features (768 -> d_model)
+        # text_feat is [B, 5, 768], we use it as query for questions
+        q_local = self.text_proj(text_feat)  # [B, 5, d_model]
+        q_mask = torch.zeros(B, q_local.size(1), device=device).bool()  # No mask needed
+        
+        # Frame decoder with question
+        frame_mask = torch.ones(B, F).bool().to(device)
+        frame_local, frame_att = self.frame_decoder(
+            frame_feat,
+            q_local,
+            memory_key_padding_mask=q_mask,
+            query_pos=self.pos_encoder_1d(frame_mask, self.d_model),
+            output_attentions=True
+        )
+        
+        # TopK frame selection
+        if self.training:
+            idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2)
+        else:
+            if self.hard_eval:
+                idx_frame = rearrange(HardtopK(frame_att.flatten(1,2), self.frame_topK), 'b (f q) k -> b f q k', f=F).sum(-2)
+            else:
+                idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2)
+        
+        frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2)
+        
+        # Object processing
+        obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B, self.frame_topK, O, -1)
+        obj_local = self.obj_resize(obj_feat)
+        
+        q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
+        q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0)
+        
+        obj_local, obj_att = self.obj_decoder(
+            obj_local.flatten(0,1),
+            q_local_repeated,
+            memory_key_padding_mask=q_mask_repeated,
+            output_attentions=True
+        )
+        
+        # TopK object selection
+        if self.training:
+            idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+        else:
+            if self.hard_eval:
+                idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
+            else:
+                idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+        
+        obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+        
+        # Hierarchy grouping
+        frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
+        
+        # Overall fusion
+        frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
+        frame_obj = frame_obj.view(B, self.frame_topK, -1)
+        frame_qns_mask = torch.cat((frame_mask, q_mask), dim=1).bool()
+        
+        mem = self.vl_encoder(
+            torch.cat((frame_obj, q_local), dim=1),
+            src_key_padding_mask=frame_qns_mask,
+            pos=self.pos_encoder_1d(frame_qns_mask.bool(), self.d_model)
+        )
+        
+        # Answer decoding - use the cached text features directly as answer targets
+        # text_feat is [B, 5, 768], project to d_model
+        tgt = q_local  # [B, 5, d_model] - use as answer query
+        out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
+        
+        # Predict
+        out = self.classifier(out).squeeze(-1)
+        return out
         
 
     def forward_text(self, text_queries, device, has_ans=False):

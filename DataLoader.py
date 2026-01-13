@@ -13,23 +13,15 @@ from utils.util import transform_bb
 class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 
-                 topK_frame=16, max_samples=None, verbose=True):
+                 topK_frame=16, max_samples=None, verbose=True, 
+                 text_feature_path=None):
         """
-        Optimized DataLoader - reads directly from original PKL files (no splitting needed)
+        Optimized DataLoader with pre-extracted text features.
         
         Args:
-            split: 'train', 'val', or 'test'
-            n_query: number of answer choices (5 for multiple choice)
-            obj_num: number of objects per frame
-            sample_list_path: path to annotation directory
-            video_feature_path: path to ViT features (.pt files)
-            object_feature_path: path to object features - can be:
-                - Directory with {video_id}/*.pkl (old format, per-frame)
-                - Directory with subdirs containing {video_id}.pkl (new Kaggle format)
-            split_dir: path to split files (train.pkl/txt, valid.pkl/txt, test.pkl/txt)
-            topK_frame: number of frames to sample
-            max_samples: max videos to load (None = no limit, useful for debugging)
-            verbose: print detailed logs
+            text_feature_path: Path to cached DeBERTa features (optional).
+                               If provided, loads from {split}_text_features.pkl
+                               If None, text will be processed by model during forward pass
         """
         super().__init__()
         self.split = split
@@ -39,6 +31,20 @@ class VideoQADataset(Dataset):
         self.object_feature_path = object_feature_path
         self.topK_frame = topK_frame
         self.verbose = verbose
+        self.text_feature_path = text_feature_path
+        
+        # Load cached text features if available
+        self.text_features = None
+        if text_feature_path:
+            text_file = osp.join(text_feature_path, f"{split}_text_features.pkl")
+            if osp.exists(text_file):
+                with open(text_file, 'rb') as f:
+                    self.text_features = pkl.load(f)
+                if self.verbose:
+                    print(f"[{split}] Loaded {len(self.text_features)} cached text features")
+            else:
+                if self.verbose:
+                    print(f"[{split}] WARNING: Text feature file not found: {text_file}")
 
         # Detect object feature format
         self.obj_format = self._detect_obj_format()
@@ -69,14 +75,10 @@ class VideoQADataset(Dataset):
                 if self.verbose:
                     print(f"[{split}] Loaded {len(valid_vids)} video IDs from {txt_path}")
 
-        # Fallback: use annotation directories
         if not valid_vids and osp.isdir(sample_list_path):
             valid_vids = {d for d in os.listdir(sample_list_path) 
                          if osp.isdir(osp.join(sample_list_path, d))}
-            if self.verbose:
-                print(f"[{split}] Fallback: {len(valid_vids)} videos from annotations")
 
-        # Apply max_samples limit
         if max_samples and len(valid_vids) > max_samples:
             valid_vids = set(list(valid_vids)[:max_samples])
             if self.verbose:
@@ -87,12 +89,10 @@ class VideoQADataset(Dataset):
         obj_available = set()
         
         for vid in valid_vids:
-            # Check ViT - directly in folder (no split subfolder)
             vit_path = osp.join(self.video_feature_path, f"{vid}.pt")
             if osp.exists(vit_path):
                 vit_available.add(vid)
             
-            # Check Object based on format
             if self._has_object_feature(vid):
                 obj_available.add(vid)
         
@@ -135,58 +135,49 @@ class VideoQADataset(Dataset):
                                 r[f"a{i}"] = c
                             rows.append(r)
             except Exception as e:
-                if self.verbose:
-                    print(f"[{split}] Error parsing {vid}: {e}")
+                pass
 
         self.sample_list = pd.DataFrame(rows)
         
+        # Filter by available text features if using cached
+        if self.text_features:
+            available_keys = set(self.text_features.keys())
+            self.sample_list['qns_key'] = self.sample_list.apply(
+                lambda x: f"{x['video_id']}_{x['type']}", axis=1)
+            before = len(self.sample_list)
+            self.sample_list = self.sample_list[self.sample_list['qns_key'].isin(available_keys)]
+            if self.verbose and before != len(self.sample_list):
+                print(f"[{split}] Filtered to {len(self.sample_list)} samples with text features")
+        
         if self.verbose:
-            print(f"[{split}] Final: {len(self.sample_list)} QA pairs from {len(valid_vids)} videos")
-            if len(self.sample_list) > 0:
-                type_counts = self.sample_list['type'].value_counts()
-                for qtype, count in type_counts.items():
-                    print(f"    {qtype}: {count}")
+            print(f"[{split}] Final: {len(self.sample_list)} QA pairs")
 
     def _detect_obj_format(self):
-        """Detect object feature storage format"""
         if not osp.exists(self.object_feature_path):
             return 'unknown'
-        
         items = os.listdir(self.object_feature_path)
-        
-        # Check for subdirectories with PKL files (Kaggle format)
         for item in items[:5]:
             item_path = osp.join(self.object_feature_path, item)
             if osp.isdir(item_path):
                 sub_items = os.listdir(item_path)
-                # If subdir contains .pkl files directly (per-video format)
                 if any(f.endswith('.pkl') for f in sub_items):
-                    # Check if it's Kaggle format (features_node_X) or old format (video_id dirs)
-                    if 'features_node' in item or any(f.endswith('.pkl') and '_' in f for f in sub_items):
-                        return 'kaggle_subdirs'  # PKL in subdirs like features_node_X/video.pkl
-                    else:
-                        return 'per_frame'  # video_id/0.pkl, 1.pkl, ...
-        
-        return 'per_frame'  # Default
+                    if 'features_node' in item:
+                        return 'kaggle_subdirs'
+        return 'per_frame'
 
     def _has_object_feature(self, vid):
-        """Check if object features exist for a video"""
         if self.obj_format == 'kaggle_subdirs':
-            # Search in subdirectories
             for subdir in os.listdir(self.object_feature_path):
                 subdir_path = osp.join(self.object_feature_path, subdir)
                 if osp.isdir(subdir_path):
-                    pkl_path = osp.join(subdir_path, f"{vid}.pkl")
-                    if osp.exists(pkl_path):
+                    if osp.exists(osp.join(subdir_path, f"{vid}.pkl")):
                         return True
             return False
         else:
-            # Old format: object_feature_path/video_id/
             vid_dir = osp.join(self.object_feature_path, vid)
             return osp.isdir(vid_dir) and any(f.endswith('.pkl') for f in os.listdir(vid_dir))
 
     def _find_object_pkl(self, vid):
-        """Find the pkl file for a video"""
         if self.obj_format == 'kaggle_subdirs':
             for subdir in os.listdir(self.object_feature_path):
                 subdir_path = osp.join(self.object_feature_path, subdir)
@@ -195,8 +186,7 @@ class VideoQADataset(Dataset):
                     if osp.exists(pkl_path):
                         return pkl_path
             return None
-        else:
-            return osp.join(self.object_feature_path, vid)  # Return directory
+        return osp.join(self.object_feature_path, vid)
 
     def __len__(self):
         return len(self.sample_list)
@@ -206,9 +196,9 @@ class VideoQADataset(Dataset):
         vid = str(c["video_id"])
         qns = str(c["question"])
         ans_id = int(c["answer"])
-        ans_word = [f"[CLS] {qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
+        qns_key = f"{vid}_{c['type']}"
 
-        # 1. Load ViT features - directly from folder (no split subfolder)
+        # 1. Load ViT features
         vit_path = osp.join(self.video_feature_path, f"{vid}.pt")
         ff = torch.load(vit_path, weights_only=True)
         if isinstance(ff, np.ndarray):
@@ -226,23 +216,29 @@ class VideoQADataset(Dataset):
         # 2. Load Object features
         of = self._load_object_features(vid)
         
-        qns_key = f"{vid}_{c['type']}"
+        # 3. Text features - cached or raw
+        if self.text_features and qns_key in self.text_features:
+            # Return cached [CLS] features: [5, 768]
+            text_feat = torch.from_numpy(self.text_features[qns_key]['cls']).float()
+            ans_word = text_feat  # Tensor instead of list of strings
+        else:
+            # Return raw text for model to process
+            ans_word = [f"[CLS] {qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
+
         return ff, of, qns, ans_word, ans_id, qns_key
 
     def _load_object_features(self, vid):
-        """Load object features - handles both Kaggle and old format"""
         objs = []
         
         if self.obj_format == 'kaggle_subdirs':
-            # NEW: Direct read from Kaggle PKL (shape: [16, 20, 2048])
             pkl_path = self._find_object_pkl(vid)
             if pkl_path and osp.exists(pkl_path):
                 try:
                     with open(pkl_path, 'rb') as f:
                         data = pkl.load(f)
                     
-                    feats = data.get('features')  # [16, 20, 2048]
-                    bboxes = data.get('bboxes')   # [16, 20, 4]
+                    feats = data.get('features')
+                    bboxes = data.get('bboxes')
                     
                     if feats is not None and bboxes is not None:
                         if not isinstance(feats, np.ndarray):
@@ -251,18 +247,15 @@ class VideoQADataset(Dataset):
                             bboxes = np.array(bboxes)
                         
                         num_frames = feats.shape[0]
-                        
-                        # Sample frames to topK_frame
                         if num_frames > self.topK_frame:
                             indices = np.linspace(0, num_frames - 1, self.topK_frame).astype(int)
                         else:
                             indices = list(range(num_frames))
                         
                         for i in indices:
-                            feat = torch.from_numpy(feats[i]).float()  # [20, 2048]
-                            bbox = torch.from_numpy(bboxes[i]).float()  # [20, 4]
+                            feat = torch.from_numpy(feats[i]).float()
+                            bbox = torch.from_numpy(bboxes[i]).float()
                             
-                            # Limit/pad objects
                             if feat.shape[0] > self.obj_num:
                                 feat = feat[:self.obj_num]
                                 bbox = bbox[:self.obj_num]
@@ -271,17 +264,12 @@ class VideoQADataset(Dataset):
                                 feat = torch.cat([feat, torch.zeros(p, feat.shape[1])], 0)
                                 bbox = torch.cat([bbox, torch.zeros(p, bbox.shape[1])], 0)
                             
-                            # Transform bbox and concat
                             bb = torch.from_numpy(transform_bb(bbox.numpy(), 640, 480)).float()
-                            objs.append(torch.cat([feat, bb], -1))  # [obj_num, 2053]
-                            
-                except Exception as e:
-                    pass  # Will pad with zeros below
-        
+                            objs.append(torch.cat([feat, bb], -1))
+                except:
+                    pass
         else:
-            # OLD: Per-frame PKL format
             od = osp.join(self.object_feature_path, vid)
-            
             def extract_num(x):
                 m = re.findall(r"\d+", x)
                 return int(m[-1]) if m else -1
@@ -301,8 +289,7 @@ class VideoQADataset(Dataset):
                         if isinstance(cc, dict):
                             feat = cc.get("feat", cc.get("features"))
                             bbox = cc.get("bbox", cc.get("boxes", cc.get("bboxes")))
-                            w = cc.get("img_w", 640)
-                            h = cc.get("img_h", 480)
+                            w, h = cc.get("img_w", 640), cc.get("img_h", 480)
                         else:
                             feat, bbox = cc[0], cc[1]
                             w, h = 640, 480
@@ -322,15 +309,14 @@ class VideoQADataset(Dataset):
                         
                         bb = torch.from_numpy(transform_bb(bbox.numpy(), w, h)).float()
                         objs.append(torch.cat([feat.float(), bb], -1))
-                    except Exception:
+                    except:
                         objs.append(torch.zeros(self.obj_num, 2053))
 
-        # Pad to topK_frame if needed
         while len(objs) < self.topK_frame:
             objs.append(torch.zeros(self.obj_num, 2053))
 
-        return torch.stack(objs)  # [topK_frame, obj_num, 2053]
+        return torch.stack(objs)
 
 
 if __name__ == "__main__":
-    print("DataLoader Module Ready (Optimized - Direct PKL Read)")
+    print("DataLoader Ready (with cached text feature support)")
