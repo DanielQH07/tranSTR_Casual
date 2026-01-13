@@ -87,8 +87,8 @@ class VideoQADataset(Dataset):
         obj_available = set()
         
         for vid in valid_vids:
-            # Check ViT
-            vit_path = osp.join(self.video_feature_path, self.split, f"{vid}.pt")
+            # Check ViT - directly in folder (no split subfolder)
+            vit_path = osp.join(self.video_feature_path, f"{vid}.pt")
             if osp.exists(vit_path):
                 vit_available.add(vid)
             
@@ -208,8 +208,8 @@ class VideoQADataset(Dataset):
         ans_id = int(c["answer"])
         ans_word = [f"[CLS] {qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
 
-        # 1. Load ViT features
-        vit_path = osp.join(self.video_feature_path, self.split, f"{vid}.pt")
+        # 1. Load ViT features - directly from folder (no split subfolder)
+        vit_path = osp.join(self.video_feature_path, f"{vid}.pt")
         ff = torch.load(vit_path, weights_only=True)
         if isinstance(ff, np.ndarray):
             ff = torch.from_numpy(ff)
