@@ -174,7 +174,7 @@ class VideoQAmodel(nn.Module):
         
         :param frame_feat: [bs, T, frame_feat_dim]
         :param obj_feat: [bs, T, O, obj_feat_dim]
-        :param text_feat: [bs, 5, 768] - pre-extracted [CLS] features from DeBERTa
+        :param text_feat: [bs, 5, 768] - pre-extracted [CLS] features for each QA pair
         """
         B, F, O = obj_feat.size()[:3]
         device = frame_feat.device
@@ -183,9 +183,12 @@ class VideoQAmodel(nn.Module):
         frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
         
         # Project cached text features (768 -> d_model)
-        # text_feat is [B, 5, 768], we use it as query for questions
-        q_local = self.text_proj(text_feat)  # [B, 5, d_model]
-        q_mask = torch.zeros(B, q_local.size(1), device=device).bool()  # No mask needed
+        text_feat_proj = self.text_proj(text_feat)  # [B, 5, d_model]
+        
+        # Use MEAN of 5 choices as question representation for video attention
+        # This approximates the question since all choices share the same question
+        q_local = text_feat_proj.mean(dim=1, keepdim=True)  # [B, 1, d_model]
+        q_mask = torch.zeros(B, 1, device=device).bool()
         
         # Frame decoder with question
         frame_mask = torch.ones(B, F).bool().to(device)
@@ -247,9 +250,9 @@ class VideoQAmodel(nn.Module):
             pos=self.pos_encoder_1d(frame_qns_mask.bool(), self.d_model)
         )
         
-        # Answer decoding - use the cached text features directly as answer targets
-        # text_feat is [B, 5, 768], project to d_model
-        tgt = q_local  # [B, 5, d_model] - use as answer query
+        # Answer decoding - use individual QA features as answer queries
+        # text_feat_proj is [B, 5, d_model] - each is [CLS] of "question + answer_i"
+        tgt = text_feat_proj  # [B, 5, d_model]
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
         
         # Predict
