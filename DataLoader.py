@@ -49,23 +49,32 @@ class VideoQADataset(Dataset):
         if self.verbose:
             print(f"[{split}] Object feature format: {self.obj_format}")
 
-        # Load video IDs from split
+        # Index features ONCE for O(1) access (critical for network filesystems)
+        self.obj_feature_map = self._scan_object_features()
+        self.vit_feature_set = self._scan_video_features()
+        if self.verbose:
+            print(f"[{split}] Indexed {len(self.obj_feature_map)} object features, {len(self.vit_feature_set)} ViT features")
+
+        # Load video IDs from split PKL
         valid_vids = set()
         if split_dir:
             pkl_name = 'valid' if split == 'val' else split
             pkl_path = osp.join(split_dir, f"{pkl_name}.pkl")
-            txt_path = osp.join(split_dir, f"{pkl_name}.txt")
             
             if osp.exists(pkl_path):
                 with open(pkl_path, 'rb') as f:
                     data = pkl.load(f)
-                valid_vids = set(data) if isinstance(data, (list, set)) else set(data.keys())
+                # Handle list, set, or dict
+                if isinstance(data, (list, set, tuple)):
+                    valid_vids = set(str(v) for v in data)
+                elif isinstance(data, dict):
+                    valid_vids = set(str(k) for k in data.keys())
+                else:
+                    valid_vids = set()
                 if self.verbose:
                     print(f"[{split}] Loaded {len(valid_vids)} video IDs from {pkl_path}")
-            elif osp.exists(txt_path):
-                with open(txt_path) as f:
-                    valid_vids = {l.strip() for l in f if l.strip()}
 
+        # Fallback: scan sample_list_path directories
         if not valid_vids and osp.isdir(sample_list_path):
             valid_vids = {d for d in os.listdir(sample_list_path) 
                          if osp.isdir(osp.join(sample_list_path, d))}
@@ -75,16 +84,16 @@ class VideoQADataset(Dataset):
             if self.verbose:
                 print(f"[{split}] Limited to {max_samples} videos")
 
-        # Check feature availability
-        vit_available = {vid for vid in valid_vids 
-                        if osp.exists(osp.join(self.video_feature_path, f"{vid}.pt"))}
-        obj_available = {vid for vid in valid_vids if self._has_object_feature(vid)}
+        # Filter by feature availability using O(1) set lookups
+        vit_available = valid_vids & self.vit_feature_set
+        obj_available = valid_vids & set(self.obj_feature_map.keys())
         valid_vids = vit_available & obj_available
         
         if self.verbose:
             print(f"[{split}] ViT: {len(vit_available)}, Obj: {len(obj_available)}, Both: {len(valid_vids)}")
 
-        # Parse annotations
+        # Parse annotations (unchanged loop with tqdm...)
+        # ... (rest of parsing logic is fine, it was below checks) ...
         # Using tqdm to show progress for large datasets
         from tqdm.auto import tqdm
         iterator = tqdm(valid_vids, desc=f"[{split}] Parsing annotations") if self.verbose else valid_vids
@@ -95,7 +104,6 @@ class VideoQADataset(Dataset):
             tj, aj = osp.join(vp, "text.json"), osp.join(vp, "answer.json")
             
             # Optimization: Try to open directly instead of checking exists() twice
-            # This is faster on network filesystems (Kaggle/Colab)
             try:
                 with open(tj, encoding="utf-8") as f:
                     td = json.load(f)
@@ -121,7 +129,6 @@ class VideoQADataset(Dataset):
             except (FileNotFoundError, json.JSONDecodeError):
                 continue
             except Exception as e:
-                # Unexpected errors
                 pass
 
         self.sample_list = pd.DataFrame(rows)
@@ -139,31 +146,67 @@ class VideoQADataset(Dataset):
         if self.verbose:
             print(f"[{split}] Final: {len(self.sample_list)} QA pairs")
 
+    def _scan_object_features(self):
+        """
+        Scans the object feature directory ONCE to build a map of {video_id: full_path}.
+        Handles both flat directory and 'kaggle_subdirs' structure.
+        """
+        mapping = {}
+        if not osp.exists(self.object_feature_path):
+            return mapping
+            
+        if self.obj_format == 'kaggle_subdirs':
+            # subdirs structure: object_feature_path/subdir/video_id.pkl
+            # Only scan immediate subdirectories
+            for subdir in os.listdir(self.object_feature_path):
+                subdir_path = osp.join(self.object_feature_path, subdir)
+                if osp.isdir(subdir_path):
+                    for fname in os.listdir(subdir_path):
+                        if fname.endswith('.pkl'):
+                            vid = fname[:-4] # remove .pkl
+                            mapping[vid] = osp.join(subdir_path, fname)
+        else:
+            # Flat structure or per-video folder: object_feature_path/video_id/ or object_feature_path/video_id.pkl
+            for item in os.listdir(self.object_feature_path):
+                if item.endswith('.pkl'):
+                    vid = item[:-4]
+                    mapping[vid] = osp.join(self.object_feature_path, item)
+                elif osp.isdir(osp.join(self.object_feature_path, item)):
+                     # If it's a directory per video, check for contents? 
+                     # For existing logic 'per_frame', it expects a directory
+                     mapping[item] = osp.join(self.object_feature_path, item)
+        return mapping
+
+    def _scan_video_features(self):
+        """
+        Scans the video feature directory ONCE to build a set of available video IDs.
+        Expects files named {video_id}.pt
+        """
+        available = set()
+        if not osp.exists(self.video_feature_path):
+            return available
+        for fname in os.listdir(self.video_feature_path):
+            if fname.endswith('.pt'):
+                vid = fname[:-3]  # remove .pt
+                available.add(vid)
+        return available
+
     def _detect_obj_format(self):
         if not osp.exists(self.object_feature_path):
             return 'unknown'
+        # Simple heuristic based on first few items
         for item in os.listdir(self.object_feature_path)[:5]:
             item_path = osp.join(self.object_feature_path, item)
-            if osp.isdir(item_path) and 'features_node' in item:
+            # Kaggle tends to have "features_node_X" folders
+            if osp.isdir(item_path) and ('features_node' in item or 'part' in item):
                 return 'kaggle_subdirs'
-        return 'per_frame'
+        return 'per_frame'  # Default/Fallback
 
     def _has_object_feature(self, vid):
-        if self.obj_format == 'kaggle_subdirs':
-            for subdir in os.listdir(self.object_feature_path):
-                if osp.exists(osp.join(self.object_feature_path, subdir, f"{vid}.pkl")):
-                    return True
-            return False
-        vid_dir = osp.join(self.object_feature_path, vid)
-        return osp.isdir(vid_dir) and any(f.endswith('.pkl') for f in os.listdir(vid_dir))
+        return vid in self.obj_feature_map
 
     def _find_object_pkl(self, vid):
-        if self.obj_format == 'kaggle_subdirs':
-            for subdir in os.listdir(self.object_feature_path):
-                pkl_path = osp.join(self.object_feature_path, subdir, f"{vid}.pkl")
-                if osp.exists(pkl_path):
-                    return pkl_path
-        return osp.join(self.object_feature_path, vid)
+        return self.obj_feature_map.get(vid)
 
     def __len__(self):
         return len(self.sample_list)

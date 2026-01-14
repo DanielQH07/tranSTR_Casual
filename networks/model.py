@@ -271,7 +271,14 @@ class VideoQAmodel(nn.Module):
         #                                                     max_length=self.qa_max_len if has_ans else self.q_max_len, 
         #                                                     return_tensors='pt')
         tokenized_queries = tokenized_queries.to(device)
-        with torch.inference_mode(mode=self.freeze_text_encoder):
+        
+        # Use no_grad when freezing (inference_mode causes issues with backprop)
+        if self.freeze_text_encoder:
+            with torch.no_grad():
+                encoded_text = self.text_encoder(**tokenized_queries).last_hidden_state
+            # Detach and clone to allow gradient flow through text_proj
+            encoded_text = encoded_text.detach().clone()
+        else:
             encoded_text = self.text_encoder(**tokenized_queries).last_hidden_state
         
         # Project text from 768 to d_model
