@@ -85,14 +85,17 @@ class VideoQADataset(Dataset):
             print(f"[{split}] ViT: {len(vit_available)}, Obj: {len(obj_available)}, Both: {len(valid_vids)}")
 
         # Parse annotations
+        # Using tqdm to show progress for large datasets
+        from tqdm.auto import tqdm
+        iterator = tqdm(valid_vids, desc=f"[{split}] Parsing annotations") if self.verbose else valid_vids
+        
         rows = []
-        for vid in valid_vids:
+        for vid in iterator:
             vp = osp.join(sample_list_path, vid)
             tj, aj = osp.join(vp, "text.json"), osp.join(vp, "answer.json")
             
-            if not (osp.exists(tj) and osp.exists(aj)):
-                continue
-                
+            # Optimization: Try to open directly instead of checking exists() twice
+            # This is faster on network filesystems (Kaggle/Colab)
             try:
                 with open(tj, encoding="utf-8") as f:
                     td = json.load(f)
@@ -115,7 +118,10 @@ class VideoQADataset(Dataset):
                             for i, c in enumerate(q["reason"]):
                                 r[f"a{i}"] = c
                             rows.append(r)
-            except:
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            except Exception as e:
+                # Unexpected errors
                 pass
 
         self.sample_list = pd.DataFrame(rows)
