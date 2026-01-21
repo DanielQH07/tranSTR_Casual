@@ -33,10 +33,11 @@ def train(model, optimizer, train_loader, xe, device, use_amp=True, scaler=None)
     for iter, inputs in enumerate(train_loader):
         # videos, qns_w, ans_w, ans_id, _ = inputs
         # video_inputs = videos.to(device)
-        vid_frame_inputs, vid_obj_inputs, qns_w, ans_w, ans_id, _ = inputs
+        vid_frame_inputs, vid_obj_inputs, qns_w, ans_w, ans_id, _, som_data = inputs
         vid_frame_feat = vid_frame_inputs.to(device)
         vid_obj_feat = vid_obj_inputs.to(device)
         ans_targets = ans_id.to(device)
+        # TODO: Pass som_data to model when SoM integration is ready
         
         with torch.amp.autocast('cuda', enabled=use_amp):
              out_f = model( vid_frame_feat, vid_obj_feat, qns_w, ans_w)
@@ -71,9 +72,10 @@ def eval(model, val_loader, device):
         for iter, inputs in enumerate(val_loader):
             # videos, qns_w, ans_w, ans_id, _ = inputs
             # video_inputs = videos.to(device)
-            vid_frame_inputs, vid_obj_inputs, qns_w, ans_w, ans_id, _ = inputs
+            vid_frame_inputs, vid_obj_inputs, qns_w, ans_w, ans_id, _, som_data = inputs
             vid_frame_feat = vid_frame_inputs.to(device)
             vid_obj_feat = vid_obj_inputs.to(device)
+            # TODO: Pass som_data to model when SoM integration is ready
             out = model( vid_frame_feat, vid_obj_feat, qns_w, ans_w)
             prediction=out.max(-1)[1] # bs,            
             prediction_list.append(prediction)
@@ -100,12 +102,10 @@ def predict(model,test_loader, device):
         for iter, inputs in enumerate(test_loader):
             # videos, qns_w, ans_w, ans_id, qns_keys = inputs
             # video_inputs = videos.to(device)
-            # qns_keys is passed in test_loader (see DataLoader logic in previous turns)
-            # Need to ensure DataLoader returns 6 items for test split in the MAIN block too?
-            # Yes, standard return is (frames, objs, q, a, id, keys)
-            vid_frame_inputs, vid_obj_inputs, qns_w, ans_w, ans_id, qns_keys = inputs
+            vid_frame_inputs, vid_obj_inputs, qns_w, ans_w, ans_id, qns_keys, som_data = inputs
             vid_frame_feat = vid_frame_inputs.to(device)
             vid_obj_feat = vid_obj_inputs.to(device)
+            # TODO: Pass som_data to model when SoM integration is ready
             out = model(vid_frame_feat, vid_obj_feat, qns_w, ans_w)
             prediction=out.max(-1)[1] # bs,
             prediction_list.append(prediction)

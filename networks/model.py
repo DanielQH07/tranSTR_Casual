@@ -16,6 +16,7 @@ from networks.multimodal_transformer import TransformerEncoderLayer, Transformer
 from networks.position_encoding import PositionEmbeddingSine1D
 from transformers import AutoModel, AutoTokenizer
 from networks.topk import HardtopK, PerturbedTopK
+from networks.som_injection import SoMInjector
 
 # from networks.encoder import EncoderVid
 # from block import fusions #pytorch >= 1.1.0
@@ -25,7 +26,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface to
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
-                        frame_feat_dim=4096, obj_feat_dim=2053, **kwargs):
+                        frame_feat_dim=4096, obj_feat_dim=2053, use_som=False, num_marks=16, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -71,6 +72,18 @@ class VideoQAmodel(nn.Module):
 
         # cls head
         self.classifier=nn.Linear(self.d_model, 1) # ans_num+<unk>
+        
+        # Set-of-Mark Injection (optional)
+        self.use_som = use_som
+        if use_som:
+            self.som_injector = SoMInjector(
+                d_model=self.d_model,
+                obj_feat_dim=2048,  # Only visual features, not bbox
+                num_marks=num_marks,
+                gamma_init=0.1,
+                beta_init=0.1
+            )
+            print(f"[SoM] Enabled with {num_marks} marks")
 
     #     self._reset_parameters()
 
@@ -80,11 +93,12 @@ class VideoQAmodel(nn.Module):
     #             # if p.dim() > 1:
     #             nn.init.xavier_uniform_(p)
 
-    def forward(self, frame_feat, obj_feat, qns_word, ans_word):
+    def forward(self, frame_feat, obj_feat, qns_word, ans_word, som_data=None):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
         :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
         :param qns: ('what are three people sitting on?', 'what is a family having?')
+        :param som_data: Optional list of SoM data dicts for Token Mark injection
         :return:
         """
         # Size
@@ -93,6 +107,10 @@ class VideoQAmodel(nn.Module):
         
         # Resize frame features to d_model
         frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
+        
+        # Apply SoM injection if enabled
+        if self.use_som and som_data is not None:
+            frame_feat, obj_feat = self.som_injector(frame_feat, obj_feat, som_data)
         
         # encode q
         q_local, q_mask = self.forward_text(list(qns_word), device)  # [batch, q_len, d_model]

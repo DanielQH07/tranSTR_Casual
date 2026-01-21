@@ -14,7 +14,7 @@ class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 
                  topK_frame=16, max_samples=None, verbose=True, 
-                 text_feature_path=None):
+                 text_feature_path=None, som_feature_path=None):
         """
         Optimized DataLoader with pre-extracted text features.
         
@@ -32,6 +32,7 @@ class VideoQADataset(Dataset):
         self.topK_frame = topK_frame
         self.verbose = verbose
         self.text_feature_path = text_feature_path
+        self.som_feature_path = som_feature_path
         
         # Load cached text features if available
         self.text_features = None
@@ -225,7 +226,10 @@ class VideoQADataset(Dataset):
             # Return raw text for model to process
             ans_word = [f"[CLS] {qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
 
-        return ff, of, qns, ans_word, ans_id, qns_key
+        # 4. Load SoM features
+        som_data = self._load_som_features(vid)
+
+        return ff, of, qns, ans_word, ans_id, qns_key, som_data
 
     def _load_object_features(self, vid):
         objs = []
@@ -316,6 +320,66 @@ class VideoQADataset(Dataset):
             objs.append(torch.zeros(self.obj_num, 2053))
 
         return torch.stack(objs)
+
+    def _load_som_features(self, vid):
+        """
+        Load SoM (Set-of-Mark) features from obj_mask_causal directory.
+        
+        Directory structure:
+            obj_mask_causal/
+            ├── id_masks/<video_id>.npz   (frame_0..frame_15, each H×W uint8)
+            └── metadata_json/<video_id>.json (entity_colors, entity_names, object_to_entity)
+        
+        Returns:
+            dict with keys: 'frame_masks', 'entity_colors', 'entity_names', 'object_to_entity'
+            or None if not available
+        """
+        if not self.som_feature_path:
+            return None
+        
+        mask_path = osp.join(self.som_feature_path, "id_masks", f"{vid}.npz")
+        meta_path = osp.join(self.som_feature_path, "metadata_json", f"{vid}.json")
+        
+        if not osp.exists(mask_path) or not osp.exists(meta_path):
+            return None
+        
+        try:
+            # Load masks from npz
+            masks_data = np.load(mask_path)
+            frame_masks = {}
+            for key in masks_data.keys():
+                # key format: frame_0, frame_1, ..., frame_15
+                if key.startswith('frame_'):
+                    frame_idx = int(key.split('_')[1])
+                    mask = masks_data[key]  # H×W uint8, 0=background, 1..N=entity IDs
+                    frame_masks[frame_idx] = torch.from_numpy(mask).long()
+            
+            # Load metadata from json
+            with open(meta_path, 'r', encoding='utf-8') as f:
+                metadata = json.load(f)
+            
+            entity_colors = metadata.get('entity_colors', {})
+            entity_names = metadata.get('entity_names', {})
+            object_to_entity = metadata.get('object_to_entity', {})
+            
+            # Convert string keys to int where applicable
+            entity_colors = {int(k): v for k, v in entity_colors.items()}
+            entity_names = {int(k): v for k, v in entity_names.items()}
+            object_to_entity = {
+                int(frame_idx): {int(obj_idx): entity_id for obj_idx, entity_id in mapping.items()}
+                for frame_idx, mapping in object_to_entity.items()
+            }
+            
+            return {
+                'frame_masks': frame_masks,
+                'entity_colors': entity_colors,
+                'entity_names': entity_names,
+                'object_to_entity': object_to_entity
+            }
+        except Exception as e:
+            if self.verbose:
+                print(f"[WARNING] Failed to load SoM for {vid}: {e}")
+            return None
 
 
 if __name__ == "__main__":
