@@ -348,9 +348,9 @@ class VideoQADataset(Dataset):
             masks_data = np.load(mask_path)
             frame_masks = {}
             for key in masks_data.keys():
-                # key format: frame_0, frame_1, ..., frame_15
-                if key.startswith('frame_'):
-                    frame_idx = int(key.split('_')[1])
+                # Actual key format: f0, f1, ..., f15 (not frame_0, frame_1)
+                if key.startswith('f') and key[1:].isdigit():
+                    frame_idx = int(key[1:])
                     mask = masks_data[key]  # H×W uint8, 0=background, 1..N=entity IDs
                     frame_masks[frame_idx] = torch.from_numpy(mask).long()
             
@@ -358,17 +358,13 @@ class VideoQADataset(Dataset):
             with open(meta_path, 'r', encoding='utf-8') as f:
                 metadata = json.load(f)
             
-            entity_colors = metadata.get('entity_colors', {})
-            entity_names = metadata.get('entity_names', {})
-            object_to_entity = metadata.get('object_to_entity', {})
+            # Actual format: {"id_to_label": {"1": "person_1", "2": "person_2"}}
+            id_to_label = metadata.get('id_to_label', {})
             
-            # Convert string keys to int where applicable
-            entity_colors = {int(k): v for k, v in entity_colors.items()}
-            entity_names = {int(k): v for k, v in entity_names.items()}
-            object_to_entity = {
-                int(frame_idx): {int(obj_idx): entity_id for obj_idx, entity_id in mapping.items()}
-                for frame_idx, mapping in object_to_entity.items()
-            }
+            # Convert to expected format
+            entity_names = {int(k): v for k, v in id_to_label.items()}
+            entity_colors = {int(k): [255, 0, 0] for k in id_to_label.keys()}  # Placeholder
+            object_to_entity = {}  # Not in actual data
             
             return {
                 'frame_masks': frame_masks,
