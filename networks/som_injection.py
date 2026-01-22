@@ -342,7 +342,13 @@ class SoMInjector(nn.Module):
     """
     Main Set-of-Mark Injection module that orchestrates all injection components.
     
-    This is the top-level module to be integrated into VideoQAmodel.
+    This module is integrated into VideoQAmodel AFTER frame/object resize.
+    All features are in d_model space when this is called.
+    
+    Key fixes (v2):
+    - Works with resized features (all in d_model dimensions)
+    - Properly normalizes mask weights to avoid gradient explosion
+    - Uses idx_frame to map selected frames back to original mask frames
     """
     
     def __init__(self, d_model: int = 768, obj_feat_dim: int = 2048,
@@ -351,105 +357,258 @@ class SoMInjector(nn.Module):
         super().__init__()
         
         self.palette = TokenMarkPalette(num_marks, d_model)
-        self.visual_injector = VisualMarkInjector(d_model, obj_feat_dim, gamma_init, omega)
-        self.text_injector = TextMarkInjector(d_model, beta_init)
         self.entity_matcher = EntityMatcher()
         
         self.num_marks = num_marks
         self.d_model = d_model
+        self.omega = omega
+        
+        # Projection for frame marks (d_model -> d_model, learnable transform)
+        self.proj_frame = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        
+        # Projection for object marks (d_model -> d_model)
+        self.proj_obj = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
+        
+        # Learnable injection scales
+        self.gamma_frame = nn.Parameter(torch.tensor(gamma_init))
+        self.gamma_obj = nn.Parameter(torch.tensor(gamma_init))
     
     def process_som_data(self, som_data: Optional[Dict]) -> Tuple[
         Optional[Dict[int, torch.Tensor]], 
-        Optional[Dict[int, str]], 
-        Optional[Dict[int, Dict[int, int]]]
+        Optional[Dict[int, str]]
     ]:
         """
         Extract and validate SoM data components.
         
         Returns:
-            (frame_masks, entity_names, object_to_entity)
+            (frame_masks, entity_names)
         """
         if som_data is None:
-            return None, None, None
+            return None, None
         
         frame_masks = som_data.get('frame_masks', {})
         entity_names = som_data.get('entity_names', {})
-        object_to_entity = som_data.get('object_to_entity', {})
         
-        return frame_masks, entity_names, object_to_entity
+        return frame_masks, entity_names
     
     def get_active_mark_embeddings(self, entity_names: Dict[int, str], 
-                                    device: torch.device) -> torch.Tensor:
+                                    device: torch.device) -> Tuple[Optional[torch.Tensor], Dict[int, int]]:
         """
         Get mark embeddings for active entities in current sample.
         
+        Args:
+            entity_names: {entity_id: "label"} - entity IDs may be non-contiguous (e.g., {1, 3, 5})
+            device: torch device
+            
         Returns:
-            [K, d_model] where K = max(entity_ids) mark embeddings
+            Tuple of:
+            - mark_embeddings: [K, d_model] where K = number of unique entities
+            - entity_to_mark: {entity_id: mark_index} mapping
         """
         if not entity_names:
-            return None
+            return None, {}
         
-        max_entity_id = max(entity_names.keys())
-        num_active = min(max_entity_id, self.num_marks)
+        # Get sorted entity IDs (they may be non-contiguous like {1, 3, 5})
+        entity_ids = sorted(entity_names.keys())
+        num_entities = min(len(entity_ids), self.num_marks)
         
-        indices = torch.arange(num_active, device=device)
-        return self.palette(indices)
+        if num_entities <= 0:
+            return None, {}
+        
+        # Create mapping: entity_id -> mark_index (0-indexed)
+        entity_to_mark = {eid: idx for idx, eid in enumerate(entity_ids[:num_entities])}
+        
+        # Get mark embeddings for each entity
+        indices = torch.arange(num_entities, device=device)
+        mark_embeddings = self.palette(indices)  # [num_entities, d_model]
+        
+        return mark_embeddings, entity_to_mark
     
-    def inject_visual(self, frame_feat: torch.Tensor, obj_feat: torch.Tensor,
-                      som_data_batch: List[Optional[Dict]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def inject_frame_features(self, frame_feat: torch.Tensor, 
+                               mark_embeddings: torch.Tensor,
+                               frame_masks: Dict[int, torch.Tensor],
+                               entity_to_mark: Dict[int, int]) -> torch.Tensor:
         """
-        Apply visual injection to a batch of video features.
+        Inject Token Marks into frame features (already in d_model space).
         
         Args:
-            frame_feat: [B, T, d_model] frame features
-            obj_feat: [B, T, O, obj_feat_dim] object features
-            som_data_batch: List of SoM data dicts for each sample
+            frame_feat: [T, d_model] frame features (AFTER topK selection)
+            mark_embeddings: [K, d_model] mark embeddings
+            frame_masks: {frame_idx: [H, W]} entity ID masks
+            entity_to_mark: {entity_id: mark_index} mapping for non-contiguous IDs
             
         Returns:
-            (injected_frame_feat, injected_obj_feat)
+            [T, d_model] injected frame features
         """
-        B = frame_feat.size(0)
+        if not frame_masks or mark_embeddings is None or not entity_to_mark:
+            return frame_feat
+        
+        T, D = frame_feat.shape
         device = frame_feat.device
+        result = frame_feat.clone()
         
-        injected_frames = frame_feat.clone()
-        injected_objs = obj_feat.clone()
+        # Get projected mark embeddings
+        projected_marks = self.proj_frame(mark_embeddings)  # [K, d_model]
         
-        for b in range(B):
-            som_data = som_data_batch[b] if som_data_batch else None
-            frame_masks, entity_names, obj_to_entity = self.process_som_data(som_data)
+        for frame_idx, mask in frame_masks.items():
+            if frame_idx >= T:
+                continue
             
-            if entity_names:
-                mark_emb = self.get_active_mark_embeddings(entity_names, device)
-                
-                if mark_emb is not None:
-                    # Inject into frame features
-                    injected_frames[b] = self.visual_injector.inject_frames(
-                        frame_feat[b], mark_emb, frame_masks
-                    )
+            mask = mask.to(device)
+            
+            # Compute normalized entity contributions
+            spatial_mark = torch.zeros(D, device=device)
+            total_entity_pixels = 0.0
+            
+            # First pass: count total entity pixels
+            for entity_id, mark_idx in entity_to_mark.items():
+                entity_mask = (mask == entity_id).float()  # [H, W]
+                mask_sum = entity_mask.sum().item()
+                if mask_sum > 0:
+                    total_entity_pixels += mask_sum
+            
+            # Second pass: compute weighted spatial mark
+            if total_entity_pixels > 0:
+                for entity_id, mark_idx in entity_to_mark.items():
+                    entity_mask = (mask == entity_id).float()
+                    mask_sum = entity_mask.sum().item()
                     
-                    # Inject into object features (first 2048 dims, not bbox)
-                    obj_features_only = obj_feat[b, :, :, :2048]  # [T, O, 2048]
-                    injected_obj_feats = self.visual_injector.inject_objects(
-                        obj_features_only, mark_emb, obj_to_entity, b
-                    )
-                    injected_objs[b, :, :, :2048] = injected_obj_feats
+                    if mask_sum > 0:
+                        # Normalized weight (proportion of this entity)
+                        weight = mask_sum / (total_entity_pixels + self.omega)
+                        mark_k = projected_marks[mark_idx]  # Use mapping!
+                        spatial_mark += weight * mark_k
+                
+                # Add normalized spatial mark to frame feature
+                result[frame_idx] = result[frame_idx] + self.gamma_frame * spatial_mark
         
-        return injected_frames, injected_objs
+        return result
     
-    def forward(self, frame_feat: torch.Tensor, obj_feat: torch.Tensor,
-                som_data_batch: List[Optional[Dict]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def inject_object_features(self, obj_feat: torch.Tensor,
+                                mark_embeddings: torch.Tensor,
+                                frame_masks: Dict[int, torch.Tensor],
+                                entity_to_mark: Dict[int, int]) -> torch.Tensor:
+        """
+        Inject Token Marks into object features based on entity presence in frames.
+        
+        Since we don't have object_to_entity mapping, we inject marks to ALL objects
+        proportionally based on the entities present in that frame.
+        
+        Args:
+            obj_feat: [T, O, d_model] object features (AFTER resize)
+            mark_embeddings: [K, d_model] mark embeddings
+            frame_masks: {frame_idx: [H, W]} entity ID masks
+            entity_to_mark: {entity_id: mark_index} mapping for non-contiguous IDs
+            
+        Returns:
+            [T, O, d_model] injected object features
+        """
+        if not frame_masks or mark_embeddings is None or not entity_to_mark:
+            return obj_feat
+        
+        T, O, D = obj_feat.shape
+        device = obj_feat.device
+        result = obj_feat.clone()
+        
+        # Get projected mark embeddings
+        projected_marks = self.proj_obj(mark_embeddings)  # [K, d_model]
+        
+        for frame_idx, mask in frame_masks.items():
+            if frame_idx >= T:
+                continue
+            
+            mask = mask.to(device)
+            
+            # Compute average mark for this frame based on entity presence
+            frame_mark = torch.zeros(D, device=device)
+            num_entities = 0
+            
+            for entity_id, mark_idx in entity_to_mark.items():
+                entity_mask = (mask == entity_id).float()
+                mask_sum = entity_mask.sum().item()
+                
+                if mask_sum > 0:
+                    frame_mark += projected_marks[mark_idx]  # Use mapping!
+                    num_entities += 1
+            
+            if num_entities > 0:
+                frame_mark = frame_mark / num_entities
+                # Inject to all objects in this frame
+                result[frame_idx] = result[frame_idx] + self.gamma_obj * frame_mark
+        
+        return result
+    
+    def forward(self, frame_local: torch.Tensor, obj_local: torch.Tensor,
+                som_data_batch: List[Optional[Dict]], 
+                idx_frame: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Main forward pass for visual injection.
         
+        IMPORTANT: This is called AFTER frame/obj resize and topK selection.
+        
         Args:
-            frame_feat: [B, T, d_model] frame features (after resize)
-            obj_feat: [B, T, O, obj_feat_dim] object features
+            frame_local: [B, frame_topK, d_model] selected frame features
+            obj_local: [B, frame_topK, O, d_model] object features for selected frames
             som_data_batch: List of SoM data for each batch item
+            idx_frame: [B, F, frame_topK] frame selection weights (optional)
             
         Returns:
-            (injected_frame_feat, injected_obj_feat)
+            (injected_frame_local, injected_obj_local)
         """
-        return self.inject_visual(frame_feat, obj_feat, som_data_batch)
+        B = frame_local.size(0)
+        T = frame_local.size(1)  # This is frame_topK after selection
+        device = frame_local.device
+        
+        injected_frames = frame_local.clone()
+        injected_objs = obj_local.clone()
+        
+        for b in range(B):
+            som_data = som_data_batch[b] if som_data_batch else None
+            frame_masks, entity_names = self.process_som_data(som_data)
+            
+            if entity_names and frame_masks:
+                # Get mark embeddings and entity-to-mark mapping
+                mark_emb, entity_to_mark = self.get_active_mark_embeddings(entity_names, device)
+                
+                if mark_emb is not None and entity_to_mark:
+                    # Map original frame masks to selected frame indices
+                    # If idx_frame is provided, find which original frames map to selected frames
+                    mapped_masks = {}
+                    
+                    if idx_frame is not None:
+                        # idx_frame: [B, F, frame_topK] - weights for each selected frame
+                        # Find top contributing original frame for each selected frame
+                        frame_weights = idx_frame[b]  # [F, frame_topK]
+                        top_orig_frames = frame_weights.argmax(dim=0)  # [frame_topK]
+                        
+                        # Map masks from original frames to selected frame positions
+                        for sel_idx in range(T):
+                            orig_idx = top_orig_frames[sel_idx].item()
+                            if orig_idx in frame_masks:
+                                mapped_masks[sel_idx] = frame_masks[orig_idx]
+                    else:
+                        # No mapping, assume 1:1 correspondence (first T frames)
+                        for orig_idx, mask in frame_masks.items():
+                            if orig_idx < T:
+                                mapped_masks[orig_idx] = mask
+                    
+                    # Inject into frame features
+                    injected_frames[b] = self.inject_frame_features(
+                        frame_local[b], mark_emb, mapped_masks, entity_to_mark
+                    )
+                    
+                    # Inject into object features
+                    injected_objs[b] = self.inject_object_features(
+                        obj_local[b], mark_emb, mapped_masks, entity_to_mark
+                    )
+        
+        return injected_frames, injected_objs
 
 
 # Utility functions
@@ -474,32 +633,48 @@ def box_to_mask(box: torch.Tensor, H: int, W: int) -> torch.Tensor:
 
 if __name__ == "__main__":
     # Test Token Mark components
-    print("Testing SoM Injection Module...")
+    print("Testing SoM Injection Module (v2)...")
     
     # Test palette
     palette = TokenMarkPalette(num_marks=16, d_model=768)
     marks = palette(torch.tensor([0, 3, 5]))
     print(f"✓ Palette: {marks.shape}")  # (3, 768)
     
-    # Test visual injector
-    visual_inj = VisualMarkInjector(d_model=768, obj_feat_dim=2048)
-    frame_feat = torch.randn(16, 768)
-    mark_emb = torch.randn(3, 768)
-    frame_masks = {0: torch.randint(0, 4, (224, 224))}
-    injected = visual_inj.inject_frames(frame_feat, mark_emb, frame_masks)
-    print(f"✓ Frame injection: {injected.shape}")  # (16, 768)
+    # Test full injector with d_model features (after resize)
+    som_injector = SoMInjector(d_model=768, obj_feat_dim=768, num_marks=16)
     
-    # Test full injector
-    som_injector = SoMInjector(d_model=768, obj_feat_dim=2048, num_marks=16)
-    frame_feat_batch = torch.randn(2, 16, 768)
-    obj_feat_batch = torch.randn(2, 16, 20, 2053)
+    # Simulate AFTER resize/topK: frame_local, obj_local
+    frame_topK = 4
+    num_objs = 10
+    batch_size = 2
+    
+    frame_local = torch.randn(batch_size, frame_topK, 768)  # [B, frame_topK, d_model]
+    obj_local = torch.randn(batch_size, frame_topK, num_objs, 768)  # [B, frame_topK, O, d_model]
+    
     som_data = [{
-        'frame_masks': {0: torch.randint(0, 3, (224, 224))},
+        'frame_masks': {
+            0: torch.randint(0, 3, (224, 224)),
+            1: torch.randint(0, 3, (224, 224)),
+        },
         'entity_names': {1: 'person', 2: 'car'},
-        'object_to_entity': {0: {0: 1, 1: 2}}
-    }] * 2
+    }] * batch_size
     
-    inj_frames, inj_objs = som_injector(frame_feat_batch, obj_feat_batch, som_data)
+    # Simulate idx_frame (frame selection weights)
+    F_orig = 16
+    idx_frame = torch.randn(batch_size, F_orig, frame_topK).softmax(dim=0)
+    
+    inj_frames, inj_objs = som_injector(frame_local, obj_local, som_data, idx_frame=idx_frame)
     print(f"✓ Full injection: frames={inj_frames.shape}, objs={inj_objs.shape}")
     
+    # Test without idx_frame
+    inj_frames2, inj_objs2 = som_injector(frame_local, obj_local, som_data)
+    print(f"✓ Without idx_frame: frames={inj_frames2.shape}, objs={inj_objs2.shape}")
+    
+    # Verify difference
+    frame_diff = (inj_frames - frame_local).abs().mean().item()
+    obj_diff = (inj_objs - obj_local).abs().mean().item()
+    print(f"✓ Frame injection magnitude: {frame_diff:.6f}")
+    print(f"✓ Object injection magnitude: {obj_diff:.6f}")
+    
     print("\n✅ All tests passed!")
+

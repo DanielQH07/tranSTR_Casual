@@ -78,12 +78,12 @@ class VideoQAmodel(nn.Module):
         if use_som:
             self.som_injector = SoMInjector(
                 d_model=self.d_model,
-                obj_feat_dim=2048,  # Only visual features, not bbox
+                obj_feat_dim=self.d_model,  # All features are in d_model space after resize
                 num_marks=num_marks,
                 gamma_init=0.1,
                 beta_init=0.1
             )
-            print(f"[SoM] Enabled with {num_marks} marks")
+            print(f"[SoM] Enabled with {num_marks} marks (injection after resize)")
 
     #     self._reset_parameters()
 
@@ -107,10 +107,6 @@ class VideoQAmodel(nn.Module):
         
         # Resize frame features to d_model
         frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
-        
-        # Apply SoM injection if enabled
-        if self.use_som and som_data is not None:
-            frame_feat, obj_feat = self.som_injector(frame_feat, obj_feat, som_data)
         
         # encode q
         q_local, q_mask = self.forward_text(list(qns_word), device)  # [batch, q_len, d_model]
@@ -138,7 +134,14 @@ class VideoQAmodel(nn.Module):
 
         # obj
         obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
-        obj_local = self.obj_resize(obj_feat)
+        obj_local = self.obj_resize(obj_feat)  # [B, frame_topK, O, d_model]
+        
+        # Apply SoM injection AFTER resize (so all features are in d_model space)
+        if self.use_som and som_data is not None:
+            frame_local, obj_local = self.som_injector(
+                frame_local, obj_local, som_data, 
+                idx_frame=idx_frame  # Pass frame selection indices for proper mapping
+            )
         
         # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
