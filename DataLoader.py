@@ -130,7 +130,9 @@ class VideoQADataset(Dataset):
                             rows.append(r)
                             
                         if k in ["predictive", "counterfactual"] and "reason" in q and "reason" in a:
-                            r = {"video_id": vid, "question": "Why?", 
+                            # Include full question for better frame selection context
+                            full_question = f"{q['question']} Why?"
+                            r = {"video_id": vid, "question": full_question, 
                                  "answer": a["reason"], "type": f"{k}_reason"}
                             for i, c in enumerate(q["reason"]):
                                 r[f"a{i}"] = c
