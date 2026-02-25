@@ -130,37 +130,49 @@ class VideoQAmodel(nn.Module):
             else:
                 idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
 
-        frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2) # B, Frame_K, d)
+        # Select topK frames using raw (non-SoM) features for downstream fusion
+        frame_local_raw = (frame_feat.transpose(1,2) @ idx_frame).transpose(1,2)  # [B, frame_topK, d]
 
-        # obj
-        obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
-        obj_local = self.obj_resize(obj_feat)  # [B, frame_topK, O, d_model]
-        
-        # Apply SoM injection AFTER resize (so all features are in d_model space)
+        # obj - select topK frames first (raw)
+        obj_feat_selected = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
+        obj_local_raw = self.obj_resize(obj_feat_selected)  # [B, frame_topK, O, d_model]
+
+        # Apply SoM injection for obj attention scoring only
         if self.use_som and som_data is not None:
-            frame_local, obj_local = self.som_injector(
-                frame_local, obj_local, som_data, 
-                idx_frame=idx_frame  # Pass frame selection indices for proper mapping
+            frame_local_som, obj_local_som = self.som_injector(
+                frame_local_raw, obj_local_raw, som_data,
+                idx_frame=idx_frame
             )
-        
-        # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
+        else:
+            frame_local_som, obj_local_som = frame_local_raw, obj_local_raw
+
+        # Repeat q for each frame
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0) if q_mask is not None else None
-        
-        obj_local, obj_att = self.obj_decoder(obj_local.flatten(0,1),
-                                            q_local_repeated, 
-                                            memory_key_padding_mask=q_mask_repeated,
-                                            output_attentions=True
-                                            )  # b*16,5,d        #.view(B, F, O, -1) # b,16,5,d
 
+        # --- Step 1: Get object selection index using SoM-injected features (detached, no grad) ---
+        with torch.no_grad():
+            _, obj_att_som = self.obj_decoder(obj_local_som.detach().flatten(0,1),
+                                                q_local_repeated.detach(),
+                                                memory_key_padding_mask=q_mask_repeated,
+                                                output_attentions=True
+                                                )
         if self.training:
-            idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
+            idx_obj = rearrange(self.obj_sorter(obj_att_som.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
         else:
             if self.hard_eval:
-                idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
+                idx_obj = rearrange(HardtopK(obj_att_som.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
             else:
-                idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
-        obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+                idx_obj = rearrange(self.obj_sorter(obj_att_som.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+
+        # --- Step 2: Run obj_decoder ONCE on raw features, select topK objects ---
+        obj_local_flat, _ = self.obj_decoder(obj_local_raw.flatten(0,1),
+                                            q_local_repeated,
+                                            memory_key_padding_mask=q_mask_repeated,
+                                            output_attentions=True
+                                            )
+        obj_local = (obj_local_flat.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+        frame_local = frame_local_raw
 
 
         ### hierarchy grouping
