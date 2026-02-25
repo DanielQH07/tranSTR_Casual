@@ -92,12 +92,32 @@ for model_dir in sorted(LOG_DIR.iterdir()):
         df['is_correct'] = df['is_correct'].astype(str).str.strip().str.lower() == 'true'
         df['confidence'] = pd.to_numeric(df['confidence'], errors='coerce').fillna(0.0)
         df['model'] = model_dir.name
+
+        # ── Validation: duplicate keys may cause merge issues ──
+        key_cols = ['video_id', 'question_type', 'question']
+        if all(col in df.columns for col in key_cols):
+            dup_count = int(df.duplicated(subset=key_cols, keep=False).sum())
+            if dup_count > 0:
+                print(f"  ⚠️ {model_dir.name}: {dup_count} duplicate rows for KEY_COLS {key_cols} (will be dropped during merge).")
+
+        # ── Fallback: recompute confidence from per-answer probabilities if flat ──
+        prob_cols = [f'prob_a{i}' for i in range(5)]
+        if all(col in df.columns for col in prob_cols):
+            conf_unique = df['confidence'].dropna().unique()
+            if len(conf_unique) == 1:
+                try:
+                    probs = df[prob_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
+                    df['confidence'] = probs.max(axis=1)
+                    print(f"  ℹ️ {model_dir.name}: confidence was flat; recomputed from {prob_cols}.")
+                except Exception as e:
+                    print(f"  ⚠️ {model_dir.name}: failed to recompute confidence from probabilities: {e}")
+
         model_data[model_dir.name] = df
         print(f"  📁 {model_dir.name}: {len(df_c)} correct + {len(df_i)} incorrect = {len(df)} total")
 
 MODEL_NAMES = list(model_data.keys())
 df_all = pd.concat(model_data.values(), ignore_index=True)
-print(f"\\n✅ Loaded {len(MODEL_NAMES)} models: {MODEL_NAMES}")
+print(f"\n✅ Loaded {len(MODEL_NAMES)} models: {MODEL_NAMES}")
 print(f"   Total records: {len(df_all):,}")"""))
 
 # ═══════════════════════════════════════════════════════════════════════════════
