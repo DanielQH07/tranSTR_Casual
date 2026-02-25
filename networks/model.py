@@ -137,26 +137,30 @@ class VideoQAmodel(nn.Module):
         obj_feat_selected = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
         obj_local_raw = self.obj_resize(obj_feat_selected)  # [B, frame_topK, O, d_model]
 
-        # Apply SoM injection for obj attention scoring only
+        # Repeat q for each frame
+        q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
+        q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0) if q_mask is not None else None
+
+        # --- Step 1: Get object selection index using SoM-guided attention ---
+        # SoM features: injected delta is stop-gradiented so SoM injector params don't
+        # contaminate main visual path, but obj_decoder attention (and thus obj_sorter)
+        # still receives gradient signal to learn better selection.
         if self.use_som and som_data is not None:
             frame_local_som, obj_local_som = self.som_injector(
                 frame_local_raw, obj_local_raw, som_data,
                 idx_frame=idx_frame
             )
+            # Detach only the SoM delta so injector params don't affect main gradient flow,
+            # but keep obj_local_som as a valid tensor for obj_decoder attention.
+            obj_local_for_att = obj_local_raw + (obj_local_som - obj_local_raw).detach()
         else:
-            frame_local_som, obj_local_som = frame_local_raw, obj_local_raw
+            obj_local_for_att = obj_local_raw
 
-        # Repeat q for each frame
-        q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
-        q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0) if q_mask is not None else None
-
-        # --- Step 1: Get object selection index using SoM-injected features (detached, no grad) ---
-        with torch.no_grad():
-            _, obj_att_som = self.obj_decoder(obj_local_som.detach().flatten(0,1),
-                                                q_local_repeated.detach(),
-                                                memory_key_padding_mask=q_mask_repeated,
-                                                output_attentions=True
-                                                )
+        _, obj_att_som = self.obj_decoder(obj_local_for_att.flatten(0,1),
+                                            q_local_repeated,
+                                            memory_key_padding_mask=q_mask_repeated,
+                                            output_attentions=True
+                                            )
         if self.training:
             idx_obj = rearrange(self.obj_sorter(obj_att_som.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
         else:
@@ -165,7 +169,7 @@ class VideoQAmodel(nn.Module):
             else:
                 idx_obj = rearrange(self.obj_sorter(obj_att_som.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
 
-        # --- Step 2: Run obj_decoder ONCE on raw features, select topK objects ---
+        # --- Step 2: Run obj_decoder on raw features, select topK objects using SoM-guided idx_obj ---
         obj_local_flat, _ = self.obj_decoder(obj_local_raw.flatten(0,1),
                                             q_local_repeated,
                                             memory_key_padding_mask=q_mask_repeated,
