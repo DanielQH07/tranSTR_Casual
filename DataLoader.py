@@ -242,11 +242,11 @@ class VideoQADataset(Dataset):
             qa_encoded = torch.from_numpy(tf['qa_encoded']).float() # [5, qa_len, 768]
             qa_mask = torch.from_numpy(tf['qa_mask']).bool()        # [5, qa_len]
             
-            return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key
+            return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key, idx
         else:
             # Raw text strings for real-time encoding
             ans_word = [f"{qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
-            return ff, of, qns, ans_word, ans_id, qns_key
+            return ff, of, qns, ans_word, ans_id, qns_key, idx
 
     def _load_object_features(self, vid):
         objs = []
