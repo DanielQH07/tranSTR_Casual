@@ -1,153 +1,215 @@
-# Tài Liệu Kỹ Thuật Hệ Thống TranSTR_Casual
+# Tài Liệu Kỹ Thuật TranSTR-Causal (Bản DINOv3 + Grounded-SAM)
 
-Tài liệu này mô tả chi tiết kiến trúc, luồng dữ liệu (Data Flow) và ánh xạ implementation (Code Mapping) của mô hình TranSTR cho bài toán Causal-VidQA.
+Tài liệu này mô tả kiến trúc và chuẩn dữ liệu đầu vào sau khi thay đổi pipeline:
+- Bo VIT, thay bang feature frame tu DINOv3.
+- Object su dung Grounded-SAM (grounded theo question prompt).
+- Bo buoc top-K object trong model, object da duoc lay truc tiep theo prompt.
 
-## 1. Kiến Trúc Tổng Quan (Architecture Overview)
+Muc tieu la de ban lap ke hoach sua code theo tung buoc, tranh lech shape, lech toa do box, va lech frame index.
 
-```mermaid
-graph TD
-    Input[Input Batch] --> |DataLoader| Tensors
-    Tensors --> |Forward Pass| Model[VideoQAmodel]
-    
-    subgraph Model Architecture
-        Enc[Text Encoder / Roberta] --> Q_Emb[Query Embeddings]
-        Enc --> A_Emb[Answer Embeddings]
-        
-        Vis[Visual Features] --> |Linear| Proj[Projected Features]
-        
-        Proj --> |TransformerDecoder| Frame_Att[Frame Attention]
-        Frame_Att --> |PerturbedTopK| Frame_Idx[TopK Frames Indices]
-        
-        Proj --> |Gather| Crit_F[Critical Frames]
-        Crit_F --> |TransformerDecoder| Obj_Att[Object Attention]
-        Obj_Att --> |PerturbedTopK| Obj_Idx[TopK Object Indices]
-        
-        Crit_F --> |Frame-Object Decoder| FO_Fusion[Hierarchical Visual Memory]
-        FO_Fusion --> |TransformerEncoder| VL_Fusion[Vision-Language Memory]
-        
-        A_Emb --> |TransformerDecoder| Ans_Dec[Answer Decoder]
-        VL_Fusion --> Ans_Dec
-        
-        Ans_Dec --> |Linear| Logits[Prediction Scores]
-    end
-```
+## 1. Tong quan kien truc moi
 
-## 2. Chi Tiết Kỹ Thuật & Code Mapping
+Luong xu ly de xuat:
+1. Lay mau 16 frame/video (giong pipeline cu).
+2. Trich xuat frame feature bang DINOv3 cho 16 frame.
+3. Text encoder ma hoa question.
+4. Frame decoder + frame top-K (giu nguyen co che loc frame theo question).
+5. Grounded-SAM detection theo question prompt de lay object boxes/labels/scores.
+6. ROI feature duoc cat tu frame feature map theo boxes (khong dung obj top-K nua).
+7. Frame-object fusion.
+8. Vision-language fusion.
+9. Answer decoder va classifier.
 
-### 2.1. Feature Extraction & Input Pipeline (`DataLoader.py`)
+Ghi chu:
+- Ban co the chay Grounded-SAM tren toan bo 6 cau hoi cua cung video, sau do luu rieng ket qua theo tung qtype.
+- Trong forward, van xu ly tung sample (video_id + question_type) nhu hien tai.
 
-- **Class**: `VideoQADataset`
-- **Method**: `__getitem__`
+## 2. Dinh nghia input moi va shape bat buoc
 
-**Quy trình xử lý dữ liệu đầu vào:**
-1.  **Input Image/Video**:
-    - `vid_frame_feat`: Load từ `.pt` files. Shape gốc: `[Total_Frames, 768]`.
-    - `vid_obj_feat`: Load từ `.pkl` files.
-2.  **Sampling (Cứng)**:
-    - Code thực hiện uniform sampling để cố định kích thước temporal.
-    - Biến: `indices = np.linspace(...)`.
-    - Kết quả `vid_obj_feat`: `[topK_frame, obj_num, 2048+5]`.
-3.  **Batch Construction**:
-    - `collate_fn` của Pytorch tạo batch.
-    - `qns_word`: List các câu hỏi strings.
-    - `ans_word`: List các tuples (candidates), mỗi tuple có 5 chuỗi `[CLS] Q [SEP] A`.
+### 2.1 Frame feature tu DINOv3
 
----
+Ban can xac dinh ro ban dung 1 trong 2 che do:
 
-### 2.2. Adaptive Selection Mechanism (`networks/model.py`)
+1. Global frame token
+- Shape moi frame: [D_frame]
+- Sau stack 16 frame: [16, D_frame]
+- Batch: [B, 16, D_frame]
 
-Đây là cơ chế chọn lọc thông tin quan trọng (Critical Information) sử dụng **Differentiable TopK**.
+2. Spatial feature map (khuyen nghi de cat ROI)
+- Shape moi frame: [C, Hf, Wf]
+- Sau stack 16 frame: [16, C, Hf, Wf]
+- Batch: [B, 16, C, Hf, Wf]
 
-#### A. Frame Selection (Lọc Thời Gian)
-- **Module**: `self.frame_decoder` (TransformerDecoder) & `self.frame_sorter` (PerturbedTopK).
-- **Code Logic**:
-  1.  **Calculate Attention**:
-      ```python
-      # frame_feat: [B, F, d_model]
-      # q_local: [B, L, d_model] (Question embedding)
-      _, frame_att = self.frame_decoder(frame_feat, q_local, ...)
-      # frame_att: Điểm attention thể hiện mức độ liên quan giữa Frame và Question.
-      ```
-  2.  **TopK Sorting**:
-      ```python
-      # Chọn ra indices của topK_frame quan trọng nhất
-      idx_frame = self.frame_sorter(frame_att) 
-      # idx_frame: Ma trận thưa (sparse matrix) hoặc one-hot xấp xỉ dùng để nhân.
-      ```
-  3.  **Gathering (Phép nhân ma trận)**:
-      ```python
-      frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2)
-      # Kết quả: Giảm chiều thời gian từ F -> frame_topK (ví dụ 20 -> 5).
-      ```
+Khuyen nghi:
+- Neu muon ROIAlign that su theo box, ban nen luu spatial feature map.
+- Neu chi co global token [B,16,D], ban khong cat ROI dung nghia duoc.
 
-#### B. Object Selection (Lọc Không Gian)
-- **Module**: `self.obj_decoder` & `self.obj_sorter`.
-- **Logic**: Tương tự Frame Selection, nhưng áp dụng lên chiều Objects của các Frame đã được chọn.
-  ```python
-  # obj_local: [B, frame_topK, O, d_model]
-  _, obj_att = self.obj_decoder(obj_local.flatten(0,1), q_local_repeated, ...)
-  idx_obj = self.obj_sorter(obj_att)
-  # Kết quả: Giảm chiều vật thể từ O -> obj_topK.
-  ```
+### 2.2 Object input tu Grounded-SAM
 
----
+Moi frame cho moi question can co:
+- boxes_xyxy_norm: [N, 4] (da normalize [0,1])
+- scores: [N]
+- labels_id hoac labels_text: [N]
+- valid_mask: [N] (1 la object hop le, 0 la pad)
 
-### 2.3. Multi-grain Fusion (`networks/model.py`)
+Sau khi pad den N_max/object per frame:
+- boxes: [B, 16, N_max, 4]
+- scores: [B, 16, N_max]
+- labels: [B, 16, N_max]
+- obj_mask: [B, 16, N_max]
 
-Sau khi lọc, mô hình có:
-- **Critical Frames**: `frame_local` shape `[B, frame_topK, d_model]`.
-- **Critical Objects**: `obj_local` shape `[B, frame_topK, obj_topK, d_model]`.
+Neu frame da qua top-K frame (Kf):
+- boxes_sel: [B, Kf, N_max, 4]
+- scores_sel: [B, Kf, N_max]
+- labels_sel: [B, Kf, N_max]
+- obj_mask_sel: [B, Kf, N_max]
 
-1.  **Frame-Object Fusion**:
-    - **Module**: `self.fo_decoder`
-    - **Mục đích**: Nhúng thông tin Objects vào Frame chứa nó.
-    - **Code**: `frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))`
-    - **Output**: `frame_obj` biểu diễn khung hình đã được cường hóa bởi các vật thể quan trọng bên trong.
+### 2.3 ROI feature va object token
 
-2.  **Vision-Language Fusion**:
-    - **Module**: `self.vl_encoder` (TransformerEncoder).
-    - **Input**: Nối chuỗi `[frame_obj; q_local]` (Visual tokens + Question tokens).
-    - **Self-Attention**: Cho phép các token hình ảnh và token từ ngữ tương tác toàn cục.
-    - **Output**: `mem` (Memory) - đây là ngữ cảnh giàu thông tin nhất dùng để trả lời.
+Neu co spatial feature map:
+- ROIAlign input: frame_map [B*Kf, C, Hf, Wf], boxes tren cung he toa do.
+- Roi pooled per object: [B, Kf, N_max, C_roi]
 
----
+Object token de dua vao decoder:
+- geom_embed(box + area + aspect): [B, Kf, N_max, d_model]
+- label_embed: [B, Kf, N_max, d_model]
+- score_embed: [B, Kf, N_max, d_model]
+- roi_proj: [B, Kf, N_max, d_model]
 
-### 2.4. Answer Decoder & Final Prediction
+Tong hop:
+- obj_token = LN(roi_proj + geom_embed + label_embed + score_embed)
+- Shape cuoi: [B, Kf, N_max, d_model]
 
-Phần này giải quyết câu hỏi: *"Làm thế nào chọn ra câu trả lời đúng?"*.
+## 3. Quy tac dong bo khong gian (rat quan trong)
 
-- **Module**: `self.ans_decoder` (TransformerDecoder) & `self.classifier` (Linear).
-- **Input**:
-  - `tgt`: Embedding của token `[CLS]` từ câu trả lời ứng viên (`a_seq`). Shape: `[B, n_query, d_model]`.
-  - `mem`: Visual Memory từ bước 2.3.
+Ban da bo buoc hop ly hoa khong gian theo kieu cu, nhung van phai dong bo toa do box va feature map bang mot quy uoc duy nhat.
 
-**Cơ chế hoạt động (Cross-Attention Scanning):**
-1.  **Query-Key-Value Setup**:
-    - Trong Decoder, `tgt` (Answer Candidate) đóng vai trò là **Query**.
-    - `mem` (Vision) đóng vai trò là **Key** và **Value**.
-2.  **Scanning**:
-    - Mô hình thực hiện: `Attention(Q=Ans, K=Vis, V=Vis)`.
-    - Nghĩa là: "Với câu trả lời ứng viên X này, hãy tìm xem trong Video Memory có bằng chứng nào ủng hộ (support) nó không?".
-    - Nếu tìm thấy bằng chứng khớp, vector đầu ra sẽ mang tín hiệu mạnh.
-3.  **Classification**:
-    ```python
-    out = self.ans_decoder(tgt, mem, ...)
-    out = self.classifier(out).squeeze(-1) 
-    # out shape: [Batch_Size, 5] (5 candidates)
-    ```
-    - `out` chứa 5 giá trị logit thực (scores).
+Quy tac de xai on dinh:
+1. Luu box theo toa do normalize [0,1] tren khong gian anh dau vao detector/backbone sau preprocess.
+2. Luu metadata transform:
+   - original_h, original_w
+   - model_input_h, model_input_w
+   - resize_mode (stretch/letterbox)
+   - scale, pad_x, pad_y neu letterbox
+3. Khi cat ROI tren frame feature map, phai map box sang dung he toa do cua map do.
 
-4.  **Prediction**:
-    - Trong lúc training: `CrossEntropyLoss` so sánh logits với ground truth index.
-    - Trong lúc inference: `argmax(out)` chọn candidate có điểm cao nhất.
+Neu detector va encoder preprocess khac nhau:
+- Bat buoc co ham quy doi box detector -> encoder map.
+- Neu khong, ROI se lech va attention object-frame bi hu.
 
----
+## 4. Luu y ve "detect tren ca 6 cau hoi"
 
-### 2.5. Xử lý Reasoning Types
+Ban co the detect truoc cho ca 6 qtype cua cung video, nhung can luu rieng theo key:
+- key de xuat: video_id + qtype
 
-Code xử lý câu hỏi `predictive` và `predictive_reason` hoàn toàn như nhau trong `forward pass`:
-- Chỉ khác nhau ở **đầu vào văn bản** (`qns_word`).
-- Ví dụ:
-  - Video A + Question "What happens?" -> Model chọn "Man falls".
-  - Video A + Question "Why?" -> Model chọn "Because floor is wet".
-- Kết quả `PAR` (Predictive Action+Reason) chỉ được tính là đúng (`Acc = 1`) nếu **cả hai** lần forward pass trên đều ra index đúng. Logic này nằm trong file `eval_mc.py` hoặc cell đánh giá chi tiết trong Notebook.
+Khong nen dung chung mot bo object cho tat ca qtype vi:
+- Cau hoi descriptive/explanatory/reasoning nhin doi tuong khac nhau.
+- Neu dung chung, grounding theo prompt se mat y nghia.
+
+## 5. Mapping sua code trong model/network
+
+### 5.1 DataLoader
+
+Can cap nhat output __getitem__:
+1. frame_feat_dinov3
+2. object package moi (boxes, scores, labels, obj_mask)
+3. question va answer nhu cu
+
+Shape tra ve de xai on dinh:
+- frame_feat: [16, D] hoac [16, C, Hf, Wf]
+- boxes: [16, N_max, 4]
+- scores: [16, N_max]
+- labels: [16, N_max]
+- obj_mask: [16, N_max]
+
+### 5.2 networks/model.py
+
+Buoc giu nguyen:
+- text encoder
+- frame decoder + frame top-K
+- vl encoder + ans decoder
+
+Buoc thay doi:
+1. Bo obj_sorter va bo nhanh top-K object.
+2. Them object encoder moi:
+   - box positional embedding
+   - label embedding
+   - score projection
+   - roi projection (neu co ROI feature)
+3. Tao obj_token tu object package da grounded.
+4. Gather object theo idx_frame (neu co top-K frame).
+5. Dua obj_token vao fo_decoder de fuse voi frame_local.
+
+### 5.3 networks modules nen tach rieng
+
+De de maintain, nen them file module rieng:
+- object_encoder_grounded.py
+
+Noi dung module:
+1. build_object_tokens
+2. roi_align_wrapper (neu co map)
+3. box_transform_utils
+
+## 6. Shape contract de test nhanh (checkpoint truoc khi train)
+
+Truoc khi train full, can assert shape trong forward:
+1. q_local: [B, Lq, d_model]
+2. frame_local_raw: [B, Kf, d_model]
+3. obj_token: [B, Kf, N_max, d_model]
+4. frame_obj sau fo_decoder: [B, Kf, d_model]
+5. mem: [B, Kf + Lq, d_model]
+6. logits: [B, 5]
+
+Neu roi map duoc dung:
+- roi_feat: [B, Kf, N_max, C_roi]
+
+## 7. Ke hoach sua code tung buoc (planning checklist)
+
+### Step 1 - Chot format feature va metadata
+1. Chot DINOv3 output: global hay spatial map.
+2. Chot N_max object/frame.
+3. Chot format luu boxes/scores/labels/mask/metadata transform.
+
+### Step 2 - Sua DataLoader
+1. Load frame feature moi.
+2. Load grounded object package theo key video_id + qtype.
+3. Pad object den N_max va tao obj_mask.
+4. Them unit test nho cho shape.
+
+### Step 3 - Sua model forward
+1. Giu frame selection.
+2. Gather object theo idx_frame.
+3. Build obj_token moi, bo obj_topK branch cu.
+4. Fuse frame-object va chay tiep vl + answer decoder.
+
+### Step 4 - Kiem tra alignment
+1. Ve debug box len frame goc.
+2. Ve debug box sau quy doi len feature map.
+3. Kiem tra object mask co pad dung.
+
+### Step 5 - Train baseline
+1. Chay voi box + label + score (chua ROI) de verify pipeline.
+2. Sau do mo ROI feature de tang hieu qua.
+3. So sanh voi baseline cu tren d/e/par/car/all.
+
+## 8. Rui ro thuong gap va cach tranh
+
+1. Lech frame index giua frame feature va object file
+- Cach tranh: luu frame_idx goc, assert trung khi load.
+
+2. Lech toa do do resize mode khac nhau
+- Cach tranh: luu metadata transform day du, test visual overlay.
+
+3. Object qua nhieu lam no bo nho va loang attention
+- Cach tranh: gioi han N_max, dung score threshold.
+
+4. Missing object o mot so frame
+- Cach tranh: pad zero token + obj_mask = 0.
+
+## 9. Tom tat quyet dinh kien truc
+
+1. Frame: DINOv3, van sample 16 frame nhu pipeline cu.
+2. Object: Grounded-SAM theo question prompt.
+3. Bo top-K object trong model, dung truc tiep object grounded.
+4. Van nen giu top-K frame de toi uu compute va giam nhieu.
+5. Neu can ROI that su, bat buoc luu/giu spatial feature map tu frame encoder.
