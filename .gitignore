@@ -5,3 +5,9 @@
 *.pkl
 *.tex
 *.json
+log/*
+
+# Secrets / env (never commit HF_TOKEN, API keys)
+.env
+.env.*
+*.secret
