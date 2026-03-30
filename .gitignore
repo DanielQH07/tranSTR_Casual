@@ -11,3 +11,5 @@ log/*
 .env
 .env.*
 *.secret
+docs/*
+__pycache__
