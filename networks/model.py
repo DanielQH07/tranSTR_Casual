@@ -266,10 +266,10 @@ class VideoQAmodel(nn.Module):
         out: text_embedding: bs, len, dim
             mask: bs, len (bool) [1,1,1,1,0,0]
         """
-        tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding='longest', return_tensors='pt')
-        # tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding='max_length', 
-        #                                                     max_length=self.qa_max_len if has_ans else self.q_max_len, 
-        #                                                     return_tensors='pt')
+        tokenized_queries = self.tokenizer(text_queries, padding='longest', return_tensors='pt')
+        # tokenized_queries = self.tokenizer(text_queries, padding='max_length', 
+        #                                     max_length=self.qa_max_len if has_ans else self.q_max_len, 
+        #                                     return_tensors='pt')
         tokenized_queries = tokenized_queries.to(device)
         
         # Use no_grad when freezing (inference_mode causes issues with backprop)
