@@ -25,12 +25,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface to
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
-                        frame_feat_dim=4096, obj_feat_dim=2053, **kwargs):
+                        frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
         self.mc = n_query
         self.hard_eval = hard_eval
+        self.use_grounding_dino = use_grounding_dino
+        self.objs = objs
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -56,7 +58,10 @@ class VideoQAmodel(nn.Module):
         # Add text projection layer (BERT 768 -> d_model)
         self.text_proj = nn.Linear(768, self.d_model)
         self.frame_sorter = PerturbedTopK(self.frame_topK)
-        self.obj_sorter = PerturbedTopK(self.obj_topK)
+        
+        # obj_sorter only if NOT using GroundingDINO (already filtered by text prompt)
+        if not use_grounding_dino:
+            self.obj_sorter = PerturbedTopK(self.obj_topK)
 
         # hierarchy 1: obj & frame
         self.obj_decoder = TransformerDecoder(TransformerDecoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
@@ -130,16 +135,22 @@ class VideoQAmodel(nn.Module):
                                             q_local_repeated, 
                                             memory_key_padding_mask=q_mask_repeated,
                                             output_attentions=True
-                                            )  # b*16,5,d        #.view(B, F, O, -1) # b,16,5,d
+                                            )  # b*16,O,d        #.view(B, F, O, -1) # b,16,O,d
 
-        if self.training:
-            idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
+        # GroundingDINO: skip obj_sorter (already filtered by text prompt)
+        if self.use_grounding_dino:
+            # Use all objects (already relevant from text-prompted detection)
+            obj_local = obj_local.view(B, self.frame_topK, O, -1)  # [B, frame_topK, objs, d_model]
         else:
-            if self.hard_eval:
-                idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
-            else:
+            # Original: topK object selection via attention
+            if self.training:
                 idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
-        obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+            else:
+                if self.hard_eval:
+                    idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
+                else:
+                    idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
+            obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
 
 
         ### hierarchy grouping

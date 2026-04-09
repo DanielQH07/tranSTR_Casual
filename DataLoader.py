@@ -14,13 +14,14 @@ class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 
                  topK_frame=16, max_samples=None, verbose=True, 
-                 text_feature_path=None):
+                 text_feature_path=None, grounding_dino_path=None):
         """
-        DataLoader with support for pre-extracted text features.
+        DataLoader with support for pre-extracted text features and GroundingDINO ROI features.
         
         Args:
             text_feature_path: Path to cached text features (optional)
-                If provided, returns tensor features instead of raw text
+            grounding_dino_path: Path to GroundingDINO ROI features (optional)
+                If provided, uses GroundingDINO features instead of Faster R-CNN
         """
         super().__init__()
         self.split = split
@@ -31,6 +32,8 @@ class VideoQADataset(Dataset):
         self.topK_frame = topK_frame
         self.verbose = verbose
         self.text_feature_path = text_feature_path
+        self.grounding_dino_path = grounding_dino_path
+        self.use_grounding_dino = grounding_dino_path is not None
         
         # Load cached text features
         self.text_features = None
@@ -50,7 +53,14 @@ class VideoQADataset(Dataset):
             print(f"[{split}] Object feature format: {self.obj_format}")
 
         # Index features ONCE for O(1) access (critical for network filesystems)
-        self.obj_feature_map = self._scan_object_features()
+        if self.use_grounding_dino:
+            self.gdino_feature_map = self._scan_gdino_features()
+            self.obj_feature_map = self.gdino_feature_map  # Alias for compatibility
+            if self.verbose:
+                print(f"[{split}] Using GroundingDINO features")
+        else:
+            self.obj_feature_map = self._scan_object_features()
+        
         self.vit_feature_set = self._scan_video_features()
         if self.verbose:
             print(f"[{split}] Indexed {len(self.obj_feature_map)} object features, {len(self.vit_feature_set)} ViT features")
@@ -177,6 +187,22 @@ class VideoQADataset(Dataset):
                      mapping[item] = osp.join(self.object_feature_path, item)
         return mapping
 
+    def _scan_gdino_features(self):
+        """
+        Scans the GroundingDINO feature directory to build a map of {video_id: full_path}.
+        Expects flat structure: grounding_dino_path/{video_id}.pkl
+        """
+        mapping = {}
+        if not osp.exists(self.grounding_dino_path):
+            return mapping
+        
+        for item in os.listdir(self.grounding_dino_path):
+            if item.endswith('.pkl'):
+                vid = item[:-4]  # remove .pkl
+                mapping[vid] = osp.join(self.grounding_dino_path, item)
+        
+        return mapping
+
     def _scan_video_features(self):
         """
         Scans the video feature directory ONCE to build a set of available video IDs.
@@ -232,7 +258,10 @@ class VideoQADataset(Dataset):
             ff = torch.cat([ff, torch.zeros(self.topK_frame - nf, ff.shape[1])], 0)
 
         # Load Object features
-        of = self._load_object_features(vid)
+        if self.use_grounding_dino:
+            of = self._load_gdino_object_features(vid)
+        else:
+            of = self._load_object_features(vid)
         
         # Text features - cached or raw
         if self.use_cached and qns_key in self.text_features:
@@ -247,6 +276,72 @@ class VideoQADataset(Dataset):
             # Raw text strings for real-time encoding
             ans_word = [f"{qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
             return ff, of, qns, ans_word, ans_id, qns_key
+
+    def _load_gdino_object_features(self, vid):
+        """
+        Load GroundingDINO ROI features from pickle.
+        
+        Returns:
+            torch.Tensor: [topK_frame, obj_num, 1028] where 1028 = 1024 (ROI) + 4 (bbox normalized)
+        """
+        pkl_path = self.gdino_feature_map.get(vid)
+        if not pkl_path or not osp.exists(pkl_path):
+            return torch.zeros(self.topK_frame, self.obj_num, 1028)
+        
+        try:
+            with open(pkl_path, 'rb') as f:
+                data = pkl.load(f)
+            
+            frames_data = data.get('frames', [])
+            orig_h = data.get('orig_h', 1080)
+            orig_w = data.get('orig_w', 1920)
+            
+            # Sample frames (align with frame features)
+            nf = len(frames_data)
+            if nf > self.topK_frame:
+                indices = np.linspace(0, nf - 1, self.topK_frame).astype(int)
+            else:
+                indices = range(nf)
+            
+            objs = []
+            for idx in indices:
+                frame_dict = frames_data[idx]
+                roi_feats = frame_dict.get('roi_features', np.zeros((0, 1024), dtype=np.float32))  # [N, 1024]
+                boxes_orig = frame_dict.get('boxes_xyxy_orig', np.zeros((0, 4), dtype=np.float32))  # [N, 4]
+                
+                # Normalize bbox to [0, 1]
+                if len(boxes_orig) > 0:
+                    boxes_norm = boxes_orig / np.array([orig_w, orig_h, orig_w, orig_h], dtype=np.float32)
+                else:
+                    boxes_norm = boxes_orig
+                
+                # Concat: [N, 1024] + [N, 4] = [N, 1028]
+                if len(roi_feats) > 0:
+                    obj_feat = np.concatenate([roi_feats, boxes_norm], axis=-1)
+                else:
+                    obj_feat = np.zeros((0, 1028), dtype=np.float32)
+                
+                obj_feat = torch.from_numpy(obj_feat).float()
+                
+                # Pad/truncate to obj_num
+                N = obj_feat.shape[0]
+                if N > self.obj_num:
+                    obj_feat = obj_feat[:self.obj_num]
+                elif N < self.obj_num:
+                    pad = torch.zeros(self.obj_num - N, 1028)
+                    obj_feat = torch.cat([obj_feat, pad], dim=0)
+                
+                objs.append(obj_feat)
+            
+            # Pad frames if needed
+            while len(objs) < self.topK_frame:
+                objs.append(torch.zeros(self.obj_num, 1028))
+            
+            return torch.stack(objs)  # [topK_frame, obj_num, 1028]
+        
+        except Exception as e:
+            # Fallback to zeros on error
+            return torch.zeros(self.topK_frame, self.obj_num, 1028)
 
     def _load_object_features(self, vid):
         objs = []
