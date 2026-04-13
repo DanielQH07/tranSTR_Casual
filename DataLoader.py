@@ -9,12 +9,21 @@ import numpy as np
 from torch.utils.data import Dataset
 from utils.util import transform_bb
 
+FAMILY_TO_ID = {
+    'descriptive': 0,
+    'explanatory': 1,
+    'predictive': 2,
+    'counterfactual': 3,
+    'predictive_reason': 4,
+    'counterfactual_reason': 5,
+}
+
 
 class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 
                  topK_frame=16, max_samples=None, verbose=True, 
-                 text_feature_path=None, grounding_dino_path=None):
+                 text_feature_path=None, grounding_dino_path=None, return_family_id=False):
         """
         DataLoader with support for pre-extracted text features and GroundingDINO ROI features.
         
@@ -34,6 +43,7 @@ class VideoQADataset(Dataset):
         self.text_feature_path = text_feature_path
         self.grounding_dino_path = grounding_dino_path
         self.use_grounding_dino = grounding_dino_path is not None
+        self.return_family_id = return_family_id
         
         # Load cached text features
         self.text_features = None
@@ -243,6 +253,7 @@ class VideoQADataset(Dataset):
         qns = str(c["question"])
         ans_id = int(c["answer"])
         qns_key = f"{vid}_{c['type']}"
+        q_family_id = FAMILY_TO_ID.get(str(c['type']), 0)
 
         # Load ViT features
         ff = torch.load(osp.join(self.video_feature_path, f"{vid}.pt"), weights_only=True)
@@ -270,11 +281,15 @@ class VideoQADataset(Dataset):
             q_mask = torch.from_numpy(tf['q_mask']).bool()          # [q_len]
             qa_encoded = torch.from_numpy(tf['qa_encoded']).float() # [5, qa_len, 768]
             qa_mask = torch.from_numpy(tf['qa_mask']).bool()        # [5, qa_len]
-            
+
+            if self.return_family_id:
+                return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key, q_family_id
             return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key
         else:
             # Raw text strings for real-time encoding
             ans_word = [f"{qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
+            if self.return_family_id:
+                return ff, of, qns, ans_word, ans_id, qns_key, q_family_id
             return ff, of, qns, ans_word, ans_id, qns_key
 
     def _load_gdino_object_features(self, vid):

@@ -74,12 +74,28 @@ class VideoQAmodel(nn.Module):
         # position embedding
         self.pos_encoder_1d = PositionEmbeddingSine1D()
 
-        # cls head
-        self.classifier=nn.Linear(self.d_model, 1) # ans_num+<unk>
-        self.verifier = nn.Sequential(
-            nn.LayerNorm(self.d_model),
+        # Generalized scoring heads
+        self.answer_head = nn.Linear(self.d_model, 1)
+        self.evidence_head = nn.Linear(self.d_model, 1)
+
+        # Family-aware unified knowledge verifier
+        num_question_families = kwargs.get("num_question_families", 6)
+        self.q_family_embed = nn.Embedding(num_embeddings=num_question_families, embedding_dim=self.d_model)
+        self.knowledge_head = nn.Sequential(
+            nn.Linear(self.d_model * 6, self.d_model),
+            nn.ReLU(),
+            nn.Dropout(kwargs['dropout']),
             nn.Linear(self.d_model, 1)
         )
+        self.k_proj = nn.Linear(kwargs.get("knowledge_feat_dim", self.d_model), self.d_model)
+
+        # Training weights for evidence/knowledge losses
+        self.lambda_evidence = kwargs.get("lambda_evidence", 0.3)
+        self.lambda_knowledge = kwargs.get("lambda_knowledge", 0.2)
+
+        # Backward-compat aliases for old training scripts
+        self.classifier = self.answer_head
+        self.verifier = self.evidence_head
 
     #     self._reset_parameters()
 
@@ -89,7 +105,90 @@ class VideoQAmodel(nn.Module):
     #             # if p.dim() > 1:
     #             nn.init.xavier_uniform_(p)
 
-    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False):
+    def decode_candidates(self, cand_feat):
+        answer_score = self.answer_head(cand_feat).squeeze(-1)
+        evidence_score = self.evidence_head(cand_feat).squeeze(-1)
+        return cand_feat, answer_score, evidence_score
+
+    def pool_memory(self, mem, mem_mask=None):
+        # Mean-pool by default to keep behavior stable and lightweight.
+        if mem_mask is None:
+            return mem.mean(dim=1)
+
+        # mem_mask shape [B, L]. If all tokens are marked valid, this reduces to normal mean.
+        valid = mem_mask.float().unsqueeze(-1)
+        denom = valid.sum(dim=1).clamp(min=1e-6)
+        return (mem * valid).sum(dim=1) / denom
+
+    def score_knowledge_support(self, cand_feat, mem_pool, k_feat, q_family_id):
+        qf = self.q_family_embed(q_family_id)
+        qf = qf.unsqueeze(1).expand(-1, cand_feat.size(1), -1)
+
+        mem_expand = mem_pool.unsqueeze(1).expand(-1, cand_feat.size(1), -1)
+
+        feat = torch.cat([
+            cand_feat,
+            mem_expand,
+            k_feat,
+            cand_feat * mem_expand,
+            cand_feat * k_feat,
+            qf,
+        ], dim=-1)
+
+        knowledge_score = self.knowledge_head(feat).squeeze(-1)
+        return knowledge_score
+
+    def _normalize_knowledge_feat(self, knowledge_feat, cand_feat):
+        """Normalize arbitrary knowledge features to [B, N, d_model]."""
+        bsz, num_cands = cand_feat.shape[:2]
+        device = cand_feat.device
+
+        if knowledge_feat is None:
+            return torch.zeros(bsz, num_cands, self.d_model, device=device)
+
+        if not isinstance(knowledge_feat, torch.Tensor):
+            knowledge_feat = torch.tensor(knowledge_feat, dtype=cand_feat.dtype, device=device)
+
+        knowledge_feat = knowledge_feat.to(device)
+        if knowledge_feat.dim() == 2:
+            # [B, Dk] -> [B, N, Dk]
+            knowledge_feat = knowledge_feat.unsqueeze(1).expand(-1, num_cands, -1)
+        elif knowledge_feat.dim() == 3:
+            # [B, Nk, Dk] -> [B, N, Dk]
+            if knowledge_feat.size(1) == 1:
+                knowledge_feat = knowledge_feat.expand(-1, num_cands, -1)
+            elif knowledge_feat.size(1) != num_cands:
+                if knowledge_feat.size(1) > num_cands:
+                    knowledge_feat = knowledge_feat[:, :num_cands, :]
+                else:
+                    repeat_times = (num_cands + knowledge_feat.size(1) - 1) // knowledge_feat.size(1)
+                    knowledge_feat = knowledge_feat.repeat(1, repeat_times, 1)[:, :num_cands, :]
+        else:
+            raise ValueError("knowledge_feat must be rank-2 or rank-3 tensor")
+
+        if knowledge_feat.size(-1) != self.d_model:
+            knowledge_feat = self.k_proj(knowledge_feat)
+
+        return knowledge_feat
+
+    def forward_with_knowledge(self, frame_feat, obj_feat, qns_word, ans_word, q_family_id, knowledge_feat=None):
+        """Knowledge-aware forward that returns detailed scores for reranking/training."""
+        aux = self.forward(
+            frame_feat,
+            obj_feat,
+            qns_word,
+            ans_word,
+            return_aux=True,
+            q_family_id=q_family_id,
+            knowledge_feat=knowledge_feat,
+        )
+        if "knowledge_score" in aux:
+            aux["fused_score"] = aux["answer_score"] + self.lambda_knowledge * aux["knowledge_score"]
+        else:
+            aux["fused_score"] = aux["answer_score"]
+        return aux
+
+    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
         :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
@@ -179,17 +278,37 @@ class VideoQAmodel(nn.Module):
         tgt = a_seq[:,:,0,:] # [CLS] # [batch, n_query, d_model]
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
 
-        # predict
-        logits = self.classifier(out).squeeze(-1) # 这里squeeze是由于classifier会出来最后一维是1
-        verifier_logits = self.verifier(out).squeeze(-1)
-        if return_aux:
-            return {
+        # candidate decoding
+        cand_feat, answer_score, evidence_score = self.decode_candidates(out)
+        mem_pool = self.pool_memory(mem, mem_mask=frame_qns_mask)
+
+        # Backward-compatible names
+        logits = answer_score
+        verifier_logits = evidence_score
+        aux = {
+                "cand_feat": cand_feat,
+                "answer_score": answer_score,
+                "evidence_score": evidence_score,
+                "mem": mem,
+                "mem_pool": mem_pool,
                 "logits": logits,
                 "verifier_logits": verifier_logits
             }
+
+        if q_family_id is not None:
+            if not isinstance(q_family_id, torch.Tensor):
+                q_family_id = torch.tensor(q_family_id, dtype=torch.long, device=logits.device)
+            q_family_id = q_family_id.to(logits.device).long().view(-1)
+            k_feat = self._normalize_knowledge_feat(knowledge_feat, cand_feat)
+            knowledge_score = self.score_knowledge_support(cand_feat, mem_pool, k_feat, q_family_id)
+            aux["knowledge_score"] = knowledge_score
+            aux["fused_score"] = answer_score + self.lambda_knowledge * knowledge_score
+
+        if return_aux:
+            return aux
         return logits
     
-    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False):
+    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False, q_family_id=None, knowledge_feat=None):
         """
         Forward pass using pre-extracted text features (bypasses DeBERTa).
         
@@ -276,14 +395,34 @@ class VideoQAmodel(nn.Module):
         tgt = text_feat_proj  # [B, 5, d_model]
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
         
-        # Predict
-        logits = self.classifier(out).squeeze(-1)
-        verifier_logits = self.verifier(out).squeeze(-1)
-        if return_aux:
-            return {
+        # candidate decoding
+        cand_feat, answer_score, evidence_score = self.decode_candidates(out)
+        mem_pool = self.pool_memory(mem, mem_mask=frame_qns_mask)
+
+        # Backward-compatible names
+        logits = answer_score
+        verifier_logits = evidence_score
+        aux = {
+                "cand_feat": cand_feat,
+                "answer_score": answer_score,
+                "evidence_score": evidence_score,
+                "mem": mem,
+                "mem_pool": mem_pool,
                 "logits": logits,
                 "verifier_logits": verifier_logits
             }
+
+        if q_family_id is not None:
+            if not isinstance(q_family_id, torch.Tensor):
+                q_family_id = torch.tensor(q_family_id, dtype=torch.long, device=logits.device)
+            q_family_id = q_family_id.to(logits.device).long().view(-1)
+            k_feat = self._normalize_knowledge_feat(knowledge_feat, cand_feat)
+            knowledge_score = self.score_knowledge_support(cand_feat, mem_pool, k_feat, q_family_id)
+            aux["knowledge_score"] = knowledge_score
+            aux["fused_score"] = answer_score + self.lambda_knowledge * knowledge_score
+
+        if return_aux:
+            return aux
         return logits
         
 
