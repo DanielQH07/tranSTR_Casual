@@ -2,5 +2,5 @@
 *.log
 *.tmp
 .DS_Store
-log/
+log
 __pycache__/

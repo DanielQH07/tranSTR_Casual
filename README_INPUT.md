@@ -1,8 +1,8 @@
-# TranSTR-Causal Input Guide (DINOv3 + Grounded-SAM Version)
+# TranSTR-Causal Input Guide (DINOv3 + Grounded Version)
 
 This document defines the updated input format and implementation notes for your modified pipeline:
 - ViT is replaced by DINOv3 frame features.
-- Object features are produced by Grounded-SAM.
+- Object features are produced by Grounded.
 - Object selection top-K inside the model is removed.
 - Grounding is question-driven, and detections can be precomputed for all 6 question types per video.
 
@@ -26,7 +26,7 @@ Recommended structure:
     │     ├── val/
     │     └── test/
     │
-    └── grounded_sam_objects/
+    └── grounded_objects/
                 ├── train/
                 │     ├── <video_id>_0.pkl   # descriptive
                 │     ├── <video_id>_1.pkl   # explanatory
