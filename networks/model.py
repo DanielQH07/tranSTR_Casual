@@ -76,6 +76,10 @@ class VideoQAmodel(nn.Module):
 
         # cls head
         self.classifier=nn.Linear(self.d_model, 1) # ans_num+<unk>
+        self.verifier = nn.Sequential(
+            nn.LayerNorm(self.d_model),
+            nn.Linear(self.d_model, 1)
+        )
 
     #     self._reset_parameters()
 
@@ -85,7 +89,7 @@ class VideoQAmodel(nn.Module):
     #             # if p.dim() > 1:
     #             nn.init.xavier_uniform_(p)
 
-    def forward(self, frame_feat, obj_feat, qns_word, ans_word):
+    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
         :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
@@ -176,10 +180,16 @@ class VideoQAmodel(nn.Module):
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
 
         # predict
-        out = self.classifier(out).squeeze(-1) # 这里squeeze是由于classifier会出来最后一维是1
-        return out
+        logits = self.classifier(out).squeeze(-1) # 这里squeeze是由于classifier会出来最后一维是1
+        verifier_logits = self.verifier(out).squeeze(-1)
+        if return_aux:
+            return {
+                "logits": logits,
+                "verifier_logits": verifier_logits
+            }
+        return logits
     
-    def forward_cached(self, frame_feat, obj_feat, text_feat):
+    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False):
         """
         Forward pass using pre-extracted text features (bypasses DeBERTa).
         
@@ -267,8 +277,14 @@ class VideoQAmodel(nn.Module):
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
         
         # Predict
-        out = self.classifier(out).squeeze(-1)
-        return out
+        logits = self.classifier(out).squeeze(-1)
+        verifier_logits = self.verifier(out).squeeze(-1)
+        if return_aux:
+            return {
+                "logits": logits,
+                "verifier_logits": verifier_logits
+            }
+        return logits
         
 
     def forward_text(self, text_queries, device, has_ans=False):
