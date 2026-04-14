@@ -16,6 +16,12 @@ from networks.multimodal_transformer import TransformerEncoderLayer, Transformer
 from networks.position_encoding import PositionEmbeddingSine1D
 from transformers import AutoModel, AutoTokenizer
 from networks.topk import HardtopK, PerturbedTopK
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+except ImportError:
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
 
 # from networks.encoder import EncoderVid
 # from block import fusions #pytorch >= 1.1.0
@@ -25,7 +31,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface to
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
-                        frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False, **kwargs):
+                        frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False,
+                        use_lora=False, lora_r=8, lora_alpha=16, lora_dropout=0.1,
+                        lora_target_modules=None, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -41,6 +49,28 @@ class VideoQAmodel(nn.Module):
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad_(False)
+
+        self.use_lora = use_lora
+        if self.use_lora:
+            if get_peft_model is None:
+                raise ImportError(
+                    "PEFT is required for LoRA. Please install it with: pip install peft"
+                )
+            if lora_target_modules is None:
+                lora_target_modules = ["query_proj", "key_proj", "value_proj"]
+            elif isinstance(lora_target_modules, str):
+                lora_target_modules = [m.strip() for m in lora_target_modules.split(",") if m.strip()]
+
+            lora_cfg = LoraConfig(
+                task_type=TaskType.FEATURE_EXTRACTION,
+                inference_mode=False,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules,
+                bias="none",
+            )
+            self.text_encoder = get_peft_model(self.text_encoder, lora_cfg)
 
         # Resize frame features to d_model
         self.frame_resize = FeatureResizer(

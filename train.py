@@ -174,10 +174,18 @@ if __name__ == "__main__":
     # lan model
     parser.add_argument("-text_encoder_lr","-tlr", type=float, action="store", help="learning rate for lan model", default=5e-6)
     parser.add_argument("-freeze_text_encoder", action="store_true", help="freeze text encoder")
-    parser.add_argument("-text_encoder_type", "-t", default="microsoft/deberta-base", choices=["roberta-base","distilroberta-base",\
+    parser.add_argument("-text_encoder_type", "-t", default="microsoft/deberta-v3-base", choices=["roberta-base","distilroberta-base",\
                         "bert-base-uncased", "distilbert-base-uncased","microsoft/deberta-base",\
                             "microsoft/deberta-v3-base","microsoft/deberta-v3-small", "microsoft/deberta-v3-xsmall"], type=str)
     parser.add_argument('-text_pool_mode',"-pool", default=0, choices=[0,1,2],help="0last hidden, 1mean, 2max", type=int)
+    parser.add_argument("--use_lora", action="store_true", help="Enable LoRA training on text encoder")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA scaling alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.1, help="LoRA dropout")
+    parser.add_argument("--lora_target_modules", type=str, default="query_proj,key_proj,value_proj",
+                        help="Comma-separated target modules for LoRA in text encoder")
+    parser.add_argument("--lora_lr", type=float, default=None,
+                        help="Optional LR for LoRA/text encoder params when --use_lora is enabled")
     
     # cl
     parser.add_argument("-pos_ratio", "-pr", type=float, help="postive ratio of fg token in trans decoder", default=0.7)   
@@ -189,6 +197,10 @@ if __name__ == "__main__":
     parser.add_argument("--num_workers", type=int, default=8, help="Number of dataloader workers")
     
     args = parser.parse_args()
+    if args.use_lora and args.freeze_text_encoder:
+        raise ValueError("--freeze_text_encoder cannot be used together with --use_lora")
+
+    args.lora_target_modules = [m.strip() for m in args.lora_target_modules.split(',') if m.strip()]
     set_gpu_devices(args.gpu)
     set_seed(999)
     # set_gpu_devices(args.gpu)
@@ -240,9 +252,20 @@ if __name__ == "__main__":
     config = {**vars(args)}
     model = VideoQAmodel(**config)
     
-    param_dicts = [
-    {"params": [p for n, p in model.named_parameters() if "text_encoder" not in n and p.requires_grad]},
-    {"params": [p for n, p in model.named_parameters() if "text_encoder" in n and p.requires_grad], "lr": args.text_encoder_lr}]
+    non_text_params = [p for n, p in model.named_parameters() if "text_encoder" not in n and p.requires_grad]
+    text_params = [p for n, p in model.named_parameters() if "text_encoder" in n and p.requires_grad]
+
+    param_dicts = [{"params": non_text_params}]
+    if len(text_params) > 0:
+        text_group_lr = args.text_encoder_lr
+        if args.use_lora and args.lora_lr is not None:
+            text_group_lr = args.lora_lr
+        param_dicts.append({"params": text_params, "lr": text_group_lr})
+
+    trainable_total = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    trainable_text = sum(p.numel() for n, p in model.named_parameters() if "text_encoder" in n and p.requires_grad)
+    logger.debug("Trainable params: total=%d, text_encoder=%d", trainable_total, trainable_text)
+
     optimizer = torch.optim.AdamW(params = param_dicts, lr=args.lr, weight_decay=args.decay)
     # optimizer = torch.optim.AdamW(params = [{'params':model.parameters()}], lr=args.lr, weight_decay=args.decay)
     scheduler = ReduceLROnPlateau(optimizer, 'max', factor=args.gamma, patience=args.patience, verbose=True)
