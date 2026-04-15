@@ -4,3 +4,17 @@
 .DS_Store
 log
 __pycache__/
+*.pkl
+*.tex
+*.json
+log/*
+
+# Secrets / env (never commit HF_TOKEN, API keys)
+.env
+.env.*
+*.secret
+docs/*
+__pycache__
+prediction/*
+log/*
+data/*

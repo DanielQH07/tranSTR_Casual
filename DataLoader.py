@@ -96,11 +96,11 @@ class VideoQADataset(Dataset):
 
         # Fallback: scan sample_list_path directories
         if not valid_vids and osp.isdir(sample_list_path):
-            valid_vids = {d for d in os.listdir(sample_list_path) 
+            valid_vids = {d for d in sorted(os.listdir(sample_list_path))
                          if osp.isdir(osp.join(sample_list_path, d))}
 
         if max_samples and len(valid_vids) > max_samples:
-            valid_vids = set(list(valid_vids)[:max_samples])
+            valid_vids = set(sorted(valid_vids)[:max_samples])
             if self.verbose:
                 print(f"[{split}] Limited to {max_samples} videos")
 
@@ -116,7 +116,9 @@ class VideoQADataset(Dataset):
         # ... (rest of parsing logic is fine, it was below checks) ...
         # Using tqdm to show progress for large datasets
         from tqdm.auto import tqdm
-        iterator = tqdm(valid_vids, desc=f"[{split}] Parsing annotations") if self.verbose else valid_vids
+        # Keep a stable sample order across sessions so resumed NCOD U remains aligned by idx.
+        sorted_vids = sorted(valid_vids)
+        iterator = tqdm(sorted_vids, desc=f"[{split}] Parsing annotations") if self.verbose else sorted_vids
         
         rows = []
         for vid in iterator:
@@ -140,8 +142,9 @@ class VideoQADataset(Dataset):
                                 r[f"a{i}"] = c
                             rows.append(r)
                             
-                        if k in ["predictive", "counterfactual"] and "reason" in q and "reason" in a:
-                            r = {"video_id": vid, "question": "Why?", 
+                        # Cùng câu hỏi với nhánh answer (predictive/counterfactual); chỉ khác candidates (reason).
+                        if k in ["predictive", "counterfactual"] and "reason" in q and "reason" in a and "question" in q:
+                            r = {"video_id": vid, "question": q["question"],
                                  "answer": a["reason"], "type": f"{k}_reason"}
                             for i, c in enumerate(q["reason"]):
                                 r[f"a{i}"] = c
@@ -178,16 +181,16 @@ class VideoQADataset(Dataset):
         if self.obj_format == 'kaggle_subdirs':
             # subdirs structure: object_feature_path/subdir/video_id.pkl
             # Only scan immediate subdirectories
-            for subdir in os.listdir(self.object_feature_path):
+            for subdir in sorted(os.listdir(self.object_feature_path)):
                 subdir_path = osp.join(self.object_feature_path, subdir)
                 if osp.isdir(subdir_path):
-                    for fname in os.listdir(subdir_path):
+                    for fname in sorted(os.listdir(subdir_path)):
                         if fname.endswith('.pkl'):
                             vid = fname[:-4] # remove .pkl
                             mapping[vid] = osp.join(subdir_path, fname)
         else:
             # Flat structure or per-video folder: object_feature_path/video_id/ or object_feature_path/video_id.pkl
-            for item in os.listdir(self.object_feature_path):
+            for item in sorted(os.listdir(self.object_feature_path)):
                 if item.endswith('.pkl'):
                     vid = item[:-4]
                     mapping[vid] = osp.join(self.object_feature_path, item)
@@ -221,7 +224,7 @@ class VideoQADataset(Dataset):
         available = set()
         if not osp.exists(self.video_feature_path):
             return available
-        for fname in os.listdir(self.video_feature_path):
+        for fname in sorted(os.listdir(self.video_feature_path)):
             if fname.endswith('.pt'):
                 vid = fname[:-3]  # remove .pt
                 available.add(vid)
@@ -231,7 +234,7 @@ class VideoQADataset(Dataset):
         if not osp.exists(self.object_feature_path):
             return 'unknown'
         # Simple heuristic based on first few items
-        for item in os.listdir(self.object_feature_path)[:5]:
+        for item in sorted(os.listdir(self.object_feature_path))[:5]:
             item_path = osp.join(self.object_feature_path, item)
             # Kaggle tends to have "features_node_X" folders
             if osp.isdir(item_path) and ('features_node' in item or 'part' in item):
