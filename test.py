@@ -42,6 +42,8 @@ parser.add_argument("--frame_feat_dim", type=int, default=4096,
                     help="Frame feature dimension (app+mot concatenated)")
 parser.add_argument("--obj_feat_dim", type=int, default=2053,
                     help="Object feature dimension (2048+5 bbox)")
+parser.add_argument("--grounding_dino_path", type=str, default=None,
+                    help="Path to GroundingDINO feature files")
 
 # model
 parser.add_argument("-d_model", "-md",  type=int, help="hidden dim of vq encoder", default=768) 
@@ -72,6 +74,10 @@ parser.add_argument("-pos_ratio", "-pr", type=float, help="postive ratio of fg t
 parser.add_argument("-neg_ratio", "-nr", type=float, help="negtive ratio of fg token in trans decoder", default=0.3) 
 parser.add_argument("-a", type=float, action="store", help="NCE loss multiplier", default=1) 
 parser.add_argument("--model_path", type=str, required=True, help="Path to trained model checkpoint") 
+parser.add_argument("--enable_mixer", action="store_true", help="Enable answer-conditioned CausalMemoryMixer")
+parser.add_argument("--mixer_hidden_dim", type=int, default=0, help="Mixer MLP hidden dim (0 means 2*d_model)")
+parser.add_argument("--mixer_dropout", type=float, default=0.1, help="Mixer dropout")
+parser.add_argument("--qtype_subset", type=str, default="", help="Optional comma-separated qtypes subset")
 
 
 args = parser.parse_args()
@@ -138,9 +144,12 @@ if __name__ == "__main__":
         n_query=args.n_query, 
         obj_num=args.objs,
         sample_list_path=args.sample_list_path,
+        split_dir=args.sample_list_path,
         video_feature_path=args.video_feature_path,
         text_annotation_path=args.text_annotation_path,
         qtype=args.qtype,
+        qtype_subset=args.qtype_subset if args.qtype_subset else None,
+        grounding_dino_path=args.grounding_dino_path,
         max_samples=args.max_samples
     )
     test_loader = DataLoader(dataset=test_dataset,batch_size=args.bs,shuffle=False,num_workers=8,pin_memory=True, prefetch_factor=4)
@@ -149,6 +158,8 @@ if __name__ == "__main__":
     epoch_num = args.epoch
     args.device = device
     config = {**vars(args)}
+    if args.grounding_dino_path:
+        config['use_grounding_dino'] = True
     model = VideoQAmodel(**config)
     model.to(device)
 

@@ -25,13 +25,15 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface to
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
-                        frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False, **kwargs):
+                        frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False,
+                        enable_mixer=False, mixer_hidden_dim=0, mixer_dropout=0.1, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
         self.mc = n_query
         self.hard_eval = hard_eval
         self.use_grounding_dino = use_grounding_dino
+        self.enable_mixer = enable_mixer
         self.objs = objs
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
@@ -80,6 +82,14 @@ class VideoQAmodel(nn.Module):
             nn.LayerNorm(self.d_model),
             nn.Linear(self.d_model, 1)
         )
+
+        if self.enable_mixer:
+            hidden_dim = mixer_hidden_dim if mixer_hidden_dim > 0 else self.d_model * 2
+            self.memory_mixer = CausalMemoryMixer(
+                d_model=self.d_model,
+                hidden_dim=hidden_dim,
+                dropout=mixer_dropout
+            )
 
     #     self._reset_parameters()
 
@@ -177,7 +187,21 @@ class VideoQAmodel(nn.Module):
         a_seq, _ = self.forward_text(list(chain(*ans_word)), device, has_ans=True)
         a_seq = rearrange(a_seq, '(n b) t c -> b n t c', b=B)
         tgt = a_seq[:,:,0,:] # [CLS] # [batch, n_query, d_model]
-        out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
+        mixed_mem = None
+        if self.enable_mixer:
+            # Build 5 candidate-aware memory branches by conditioning on each answer query.
+            mem_len = mem.size(1)
+            mem_expanded = mem.unsqueeze(1).expand(-1, self.mc, -1, -1).contiguous()
+            cond_flat = tgt.reshape(B * self.mc, -1)
+            mem_flat = mem_expanded.reshape(B * self.mc, mem_len, -1)
+            mixed_flat = self.memory_mixer(mem_flat, cond_flat)
+            mixed_mem = mixed_flat.view(B, self.mc, mem_len, -1)
+
+            dec_tgt = tgt.reshape(B * self.mc, 1, -1)
+            dec_mask = frame_qns_mask.unsqueeze(1).expand(-1, self.mc, -1).contiguous().reshape(B * self.mc, -1)
+            out = self.ans_decoder(dec_tgt, mixed_flat, memory_key_padding_mask=dec_mask).view(B, self.mc, -1)
+        else:
+            out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
 
         # predict
         logits = self.classifier(out).squeeze(-1) # 这里squeeze是由于classifier会出来最后一维是1
@@ -185,7 +209,11 @@ class VideoQAmodel(nn.Module):
         if return_aux:
             return {
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                "base_mem": mem,
+                "mixed_mem": mixed_mem,
+                "mem_mask": frame_qns_mask,
+                "answer_query": tgt
             }
         return logits
     
@@ -247,15 +275,18 @@ class VideoQAmodel(nn.Module):
         )
         
         # TopK object selection
-        if self.training:
-            idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+        if self.use_grounding_dino:
+            obj_local = obj_local.view(B, self.frame_topK, O, -1)
         else:
-            if self.hard_eval:
-                idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
-            else:
+            if self.training:
                 idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
-        
-        obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+            else:
+                if self.hard_eval:
+                    idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
+                else:
+                    idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+
+            obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
         
         # Hierarchy grouping
         frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
@@ -274,7 +305,20 @@ class VideoQAmodel(nn.Module):
         # Answer decoding - use individual QA features as answer queries
         # text_feat_proj is [B, 5, d_model] - each is [CLS] of "question + answer_i"
         tgt = text_feat_proj  # [B, 5, d_model]
-        out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
+        mixed_mem = None
+        if self.enable_mixer:
+            mem_len = mem.size(1)
+            mem_expanded = mem.unsqueeze(1).expand(-1, self.mc, -1, -1).contiguous()
+            cond_flat = tgt.reshape(B * self.mc, -1)
+            mem_flat = mem_expanded.reshape(B * self.mc, mem_len, -1)
+            mixed_flat = self.memory_mixer(mem_flat, cond_flat)
+            mixed_mem = mixed_flat.view(B, self.mc, mem_len, -1)
+
+            dec_tgt = tgt.reshape(B * self.mc, 1, -1)
+            dec_mask = frame_qns_mask.unsqueeze(1).expand(-1, self.mc, -1).contiguous().reshape(B * self.mc, -1)
+            out = self.ans_decoder(dec_tgt, mixed_flat, memory_key_padding_mask=dec_mask).view(B, self.mc, -1)
+        else:
+            out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
         
         # Predict
         logits = self.classifier(out).squeeze(-1)
@@ -282,9 +326,20 @@ class VideoQAmodel(nn.Module):
         if return_aux:
             return {
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                "base_mem": mem,
+                "mixed_mem": mixed_mem,
+                "mem_mask": frame_qns_mask,
+                "answer_query": tgt
             }
         return logits
+
+    def encode_text_global(self, text_queries, device):
+        text_local, text_mask = self.forward_text(text_queries, device)
+        text_mask_f = text_mask.float().unsqueeze(-1)
+        token_sum = (text_local * text_mask_f).sum(dim=1)
+        token_count = text_mask_f.sum(dim=1).clamp_min(1.0)
+        return token_sum / token_count
         
 
     def forward_text(self, text_queries, device, has_ans=False):
@@ -335,6 +390,32 @@ class FeatureResizer(nn.Module):
             x = self.layer_norm(x)
         output = self.dropout(x)
         return output
+
+
+class CausalMemoryMixer(nn.Module):
+    def __init__(self, d_model, hidden_dim, dropout=0.1):
+        super().__init__()
+        self.mem_ln = nn.LayerNorm(d_model)
+        self.cond_ln = nn.LayerNorm(d_model)
+        self.cond_proj = nn.Linear(d_model, d_model)
+        self.mix_ln = nn.LayerNorm(d_model * 2)
+        self.mix_mlp = nn.Sequential(
+            nn.Linear(d_model * 2, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+        )
+        self.gate = nn.Linear(d_model * 2, d_model)
+        self.out_drop = nn.Dropout(dropout)
+
+    def forward(self, mem, cond):
+        # mem: [B, L, D], cond: [B, D]
+        mem = self.mem_ln(mem)
+        cond = self.cond_ln(self.cond_proj(cond)).unsqueeze(1).expand(-1, mem.size(1), -1)
+        mix_input = self.mix_ln(torch.cat([mem, cond], dim=-1))
+        delta = self.mix_mlp(mix_input)
+        gate = torch.sigmoid(self.gate(mix_input))
+        return mem + self.out_drop(gate * delta)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,9 @@ class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 
                  topK_frame=16, max_samples=None, verbose=True, 
-                 text_feature_path=None, grounding_dino_path=None):
+                 text_feature_path=None, grounding_dino_path=None,
+                 text_annotation_path=None, qtype=-1, qtype_subset=None,
+                 stage_mode="qa", chain_data_root=None):
         """
         DataLoader with support for pre-extracted text features and GroundingDINO ROI features.
         
@@ -27,6 +29,10 @@ class VideoQADataset(Dataset):
         self.split = split
         self.mc = n_query
         self.obj_num = obj_num
+        self.qtype = qtype
+        self.stage_mode = stage_mode
+        self.chain_data_root = chain_data_root
+        self.chain_cache = {}
         self.video_feature_path = video_feature_path
         self.object_feature_path = object_feature_path
         self.topK_frame = topK_frame
@@ -34,6 +40,15 @@ class VideoQADataset(Dataset):
         self.text_feature_path = text_feature_path
         self.grounding_dino_path = grounding_dino_path
         self.use_grounding_dino = grounding_dino_path is not None
+
+        # Backward-compatible annotation/split root resolution.
+        self.annotation_root = text_annotation_path if text_annotation_path else sample_list_path
+        if split_dir is None and sample_list_path and osp.isdir(sample_list_path):
+            split_candidate = osp.join(sample_list_path, 'valid.pkl' if split == 'val' else f'{split}.pkl')
+            if osp.exists(split_candidate):
+                split_dir = sample_list_path
+
+        self.qtype_subset = self._normalize_qtype_subset(qtype_subset)
         
         # Load cached text features
         self.text_features = None
@@ -85,9 +100,9 @@ class VideoQADataset(Dataset):
                     print(f"[{split}] Loaded {len(valid_vids)} video IDs from {pkl_path}")
 
         # Fallback: scan sample_list_path directories
-        if not valid_vids and osp.isdir(sample_list_path):
-            valid_vids = {d for d in os.listdir(sample_list_path) 
-                         if osp.isdir(osp.join(sample_list_path, d))}
+        if not valid_vids and osp.isdir(self.annotation_root):
+            valid_vids = {d for d in os.listdir(self.annotation_root)
+                         if osp.isdir(osp.join(self.annotation_root, d))}
 
         if max_samples and len(valid_vids) > max_samples:
             valid_vids = set(list(valid_vids)[:max_samples])
@@ -110,7 +125,7 @@ class VideoQADataset(Dataset):
         
         rows = []
         for vid in iterator:
-            vp = osp.join(sample_list_path, vid)
+            vp = osp.join(self.annotation_root, vid)
             tj, aj = osp.join(vp, "text.json"), osp.join(vp, "answer.json")
             
             # Optimization: Try to open directly instead of checking exists() twice
@@ -142,6 +157,15 @@ class VideoQADataset(Dataset):
                 pass
 
         self.sample_list = pd.DataFrame(rows)
+
+        if len(self.sample_list) > 0:
+            if self.qtype != -1:
+                qtype_name = self._qtype_name_from_idx(self.qtype)
+                if qtype_name is not None:
+                    self.sample_list = self.sample_list[self.sample_list['type'] == qtype_name]
+
+            if self.qtype_subset:
+                self.sample_list = self.sample_list[self.sample_list['type'].isin(self.qtype_subset)]
         
         # Filter by text features if using cached
         if self.use_cached:
@@ -155,6 +179,43 @@ class VideoQADataset(Dataset):
         
         if self.verbose:
             print(f"[{split}] Final: {len(self.sample_list)} QA pairs")
+
+    def _qtype_name_from_idx(self, idx):
+        idx_to_type = {
+            0: 'descriptive',
+            1: 'explanatory',
+            2: 'predictive',
+            3: 'predictive_reason',
+            4: 'counterfactual',
+            5: 'counterfactual_reason',
+        }
+        return idx_to_type.get(int(idx))
+
+    def _normalize_qtype_subset(self, qtype_subset):
+        if qtype_subset is None:
+            return None
+
+        if isinstance(qtype_subset, str):
+            items = [x.strip() for x in qtype_subset.split(',') if x.strip()]
+        else:
+            items = list(qtype_subset)
+
+        normalized = []
+        valid_types = {
+            'descriptive', 'explanatory', 'predictive', 'predictive_reason',
+            'counterfactual', 'counterfactual_reason'
+        }
+        for item in items:
+            if isinstance(item, int) or (isinstance(item, str) and item.isdigit()):
+                mapped = self._qtype_name_from_idx(int(item))
+                if mapped:
+                    normalized.append(mapped)
+            else:
+                item_str = str(item).strip()
+                if item_str in valid_types:
+                    normalized.append(item_str)
+
+        return sorted(set(normalized)) if normalized else None
 
     def _scan_object_features(self):
         """
@@ -243,6 +304,7 @@ class VideoQADataset(Dataset):
         qns = str(c["question"])
         ans_id = int(c["answer"])
         qns_key = f"{vid}_{c['type']}"
+        chain_text, chain_valid = self._load_chain_target(vid, str(c['type']))
 
         # Load ViT features
         ff = torch.load(osp.join(self.video_feature_path, f"{vid}.pt"), weights_only=True)
@@ -271,11 +333,82 @@ class VideoQADataset(Dataset):
             qa_encoded = torch.from_numpy(tf['qa_encoded']).float() # [5, qa_len, 768]
             qa_mask = torch.from_numpy(tf['qa_mask']).bool()        # [5, qa_len]
             
+            if self.stage_mode == "stage1_chain":
+                return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key, chain_text, chain_valid
             return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key
         else:
             # Raw text strings for real-time encoding
             ans_word = [f"{qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
+            if self.stage_mode == "stage1_chain":
+                return ff, of, qns, ans_word, ans_id, qns_key, chain_text, chain_valid
             return ff, of, qns, ans_word, ans_id, qns_key
+
+    def _resolve_chain_file(self, vid):
+        if not self.chain_data_root:
+            return None
+
+        candidates = [
+            osp.join(self.chain_data_root, self.split, f"{vid}.json"),
+            osp.join(self.chain_data_root, f"{vid}.json"),
+        ]
+        for path in candidates:
+            if osp.exists(path):
+                return path
+        return None
+
+    def _load_chain_json(self, vid):
+        if vid in self.chain_cache:
+            return self.chain_cache[vid]
+
+        path = self._resolve_chain_file(vid)
+        if not path:
+            self.chain_cache[vid] = None
+            return None
+
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.chain_cache[vid] = data
+            return data
+        except Exception:
+            self.chain_cache[vid] = None
+            return None
+
+    def _load_chain_target(self, vid, sample_type):
+        data = self._load_chain_json(vid)
+        if not data:
+            return "", 0
+
+        if sample_type == 'explanatory':
+            block = data.get('explanatory')
+        elif sample_type in ('predictive', 'predictive_reason'):
+            block = data.get('predictive')
+        else:
+            return "", 0
+
+        if not isinstance(block, dict):
+            return "", 0
+
+        parts = []
+        fact_observation = block.get('fact_observation')
+        if isinstance(fact_observation, str) and fact_observation.strip():
+            parts.append(fact_observation.strip())
+
+        answer_chain = block.get('answer_chain')
+        if isinstance(answer_chain, dict):
+            final_hyp = answer_chain.get('final_hypothesis')
+            if isinstance(final_hyp, str) and final_hyp.strip():
+                parts.append(final_hyp.strip())
+
+        reason_chain = block.get('reason_chain')
+        if isinstance(reason_chain, dict):
+            reason_hyp = reason_chain.get('final_hypothesis')
+            if isinstance(reason_hyp, str) and reason_hyp.strip():
+                parts.append(reason_hyp.strip())
+
+        if not parts:
+            return "", 0
+        return " [SEP] ".join(parts), 1
 
     def _load_gdino_object_features(self, vid):
         """

@@ -186,6 +186,80 @@ Thêm datasets vào notebook:
 
 ## 🚀 Training
 
+### Two-stage CausalMemoryMixer (explanatory + predictive)
+
+The repository now supports a practical two-stage pipeline on top of the existing flow:
+
+1. Stage 1 (`stage1_chain`): train only the memory mixer using chain supervision.
+2. Stage 2 (`stage2_qa`): load Stage 1 weights and train QA decoder (with optional freeze-first).
+
+When `--enable_mixer` is not set, behavior stays equivalent to the existing baseline path.
+
+Chain JSON expected per video file (for Stage 1):
+
+```json
+{
+   "explanatory": {
+      "question_type": "explanatory",
+      "fact_observation": "...",
+      "answer_chain": {
+         "chain_steps": ["..."],
+         "final_hypothesis": "..."
+      },
+      "reason_chain": null
+   },
+   "predictive": {
+      "question_type": "predictive",
+      "fact_observation": "...",
+      "answer_chain": {
+         "chain_steps": ["..."],
+         "final_hypothesis": "..."
+      },
+      "reason_chain": {
+         "chain_steps": ["..."],
+         "final_hypothesis": "..."
+      }
+   }
+}
+```
+
+Recommended layout:
+
+```text
+<chain_data_root>/
+   train/<video_id>.json
+   val/<video_id>.json
+   test/<video_id>.json
+```
+
+Stage 1 example:
+
+```bash
+python train.py \
+   -v stage1_exp_pred \
+   --stage_mode stage1_chain \
+   --enable_mixer \
+   --chain_data_root "/path/to/chain_json" \
+   --qtype_subset "explanatory,predictive,predictive_reason" \
+   --sample_list_path "/path/to/dataset-split-1" \
+   --video_feature_path "/path/to/visual-feature" \
+   --text_annotation_path "/path/to/text-annotation"
+```
+
+Stage 2 example:
+
+```bash
+python train.py \
+   -v stage2_exp_pred \
+   --stage_mode stage2_qa \
+   --enable_mixer \
+   --stage1_checkpoint "./models/stage1-xxx.ckpt" \
+   --qtype_subset "explanatory,predictive,predictive_reason" \
+   --sample_list_path "/path/to/dataset-split-1" \
+   --video_feature_path "/path/to/visual-feature" \
+   --text_annotation_path "/path/to/text-annotation"
+```
+
 ### Command Line
 
 ```bash
