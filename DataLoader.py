@@ -300,11 +300,12 @@ class VideoQADataset(Dataset):
         Load GroundingDINO ROI features from pickle.
         
         Returns:
-            torch.Tensor: [topK_frame, obj_num, 1028] where 1028 = 1024 (ROI) + 4 (bbox normalized)
+            torch.Tensor: [topK_frame, obj_num, 1796] where 1796 = 1024 (ROI) + 768 (class_text_embedding) + 4 (bbox normalized)
         """
+        GDINO_DIM = 1796  # roi(1024) + cls_text_emb(768) + bbox(4)
         pkl_path = self.gdino_feature_map.get(vid)
         if not pkl_path or not osp.exists(pkl_path):
-            return torch.zeros(self.topK_frame, self.obj_num, 1028)
+            return torch.zeros(self.topK_frame, self.obj_num, GDINO_DIM)
         
         try:
             with open(pkl_path, 'rb') as f:
@@ -325,19 +326,29 @@ class VideoQADataset(Dataset):
             for idx in indices:
                 frame_dict = frames_data[idx]
                 roi_feats = frame_dict.get('roi_features', np.zeros((0, 1024), dtype=np.float32))  # [N, 1024]
+                cls_emb = frame_dict.get('class_text_embedding', np.zeros((0, 768), dtype=np.float32))  # [N, 768]
                 boxes_orig = frame_dict.get('boxes_xyxy_orig', np.zeros((0, 4), dtype=np.float32))  # [N, 4]
+                
+                n_det = len(roi_feats)
+                
+                # Align cls_emb length with roi_feats
+                if len(cls_emb) != n_det:
+                    if n_det > 0:
+                        cls_emb = np.zeros((n_det, 768), dtype=np.float32)
+                    else:
+                        cls_emb = np.zeros((0, 768), dtype=np.float32)
                 
                 # Normalize bbox to [0, 1]
                 if len(boxes_orig) > 0:
                     boxes_norm = boxes_orig / np.array([orig_w, orig_h, orig_w, orig_h], dtype=np.float32)
                 else:
-                    boxes_norm = boxes_orig
+                    boxes_norm = np.zeros((n_det, 4), dtype=np.float32) if n_det > 0 else np.zeros((0, 4), dtype=np.float32)
                 
-                # Concat: [N, 1024] + [N, 4] = [N, 1028]
-                if len(roi_feats) > 0:
-                    obj_feat = np.concatenate([roi_feats, boxes_norm], axis=-1)
+                # Concat: [N, 1024] + [N, 768] + [N, 4] = [N, 1796]
+                if n_det > 0:
+                    obj_feat = np.concatenate([roi_feats, cls_emb, boxes_norm], axis=-1)
                 else:
-                    obj_feat = np.zeros((0, 1028), dtype=np.float32)
+                    obj_feat = np.zeros((0, GDINO_DIM), dtype=np.float32)
                 
                 obj_feat = torch.from_numpy(obj_feat).float()
                 
@@ -346,20 +357,20 @@ class VideoQADataset(Dataset):
                 if N > self.obj_num:
                     obj_feat = obj_feat[:self.obj_num]
                 elif N < self.obj_num:
-                    pad = torch.zeros(self.obj_num - N, 1028)
+                    pad = torch.zeros(self.obj_num - N, GDINO_DIM)
                     obj_feat = torch.cat([obj_feat, pad], dim=0)
                 
                 objs.append(obj_feat)
             
             # Pad frames if needed
             while len(objs) < self.topK_frame:
-                objs.append(torch.zeros(self.obj_num, 1028))
+                objs.append(torch.zeros(self.obj_num, GDINO_DIM))
             
-            return torch.stack(objs)  # [topK_frame, obj_num, 1028]
+            return torch.stack(objs)  # [topK_frame, obj_num, 1796]
         
         except Exception as e:
             # Fallback to zeros on error
-            return torch.zeros(self.topK_frame, self.obj_num, 1028)
+            return torch.zeros(self.topK_frame, self.obj_num, GDINO_DIM)
 
     def _load_object_features(self, vid):
         objs = []
