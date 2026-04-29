@@ -322,12 +322,16 @@ class VideoQADataset(Dataset):
             else:
                 indices = range(nf)
             
+            def _l2_norm(x, eps=1e-8):
+                n = np.linalg.norm(x, axis=-1, keepdims=True)
+                return x / np.maximum(n, eps)
+
             objs = []
             for idx in indices:
                 frame_dict = frames_data[idx]
-                roi_feats = frame_dict.get('roi_features', np.zeros((0, 1024), dtype=np.float32))  # [N, 1024]
-                cls_emb = frame_dict.get('class_text_embedding', np.zeros((0, 768), dtype=np.float32))  # [N, 768]
-                boxes_orig = frame_dict.get('boxes_xyxy_orig', np.zeros((0, 4), dtype=np.float32))  # [N, 4]
+                roi_feats = np.asarray(frame_dict.get('roi_features', np.zeros((0, 1024), dtype=np.float32)), dtype=np.float32)  # [N, 1024]
+                cls_emb = np.asarray(frame_dict.get('class_text_embedding', np.zeros((0, 768), dtype=np.float32)), dtype=np.float32)  # [N, 768]
+                boxes_orig = np.asarray(frame_dict.get('boxes_xyxy_orig', np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)  # [N, 4]
                 
                 n_det = len(roi_feats)
                 
@@ -343,6 +347,15 @@ class VideoQADataset(Dataset):
                     boxes_norm = boxes_orig / np.array([orig_w, orig_h, orig_w, orig_h], dtype=np.float32)
                 else:
                     boxes_norm = np.zeros((n_det, 4), dtype=np.float32) if n_det > 0 else np.zeros((0, 4), dtype=np.float32)
+                
+                # Sanitize NaN/Inf and L2-normalize each feature block to keep scales comparable
+                # (mixed-scale features cause gradient explosion through obj_resize Linear layer).
+                if n_det > 0:
+                    roi_feats = np.nan_to_num(roi_feats, nan=0.0, posinf=0.0, neginf=0.0)
+                    cls_emb = np.nan_to_num(cls_emb, nan=0.0, posinf=0.0, neginf=0.0)
+                    boxes_norm = np.nan_to_num(np.clip(boxes_norm, 0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0)
+                    roi_feats = _l2_norm(roi_feats)
+                    cls_emb = _l2_norm(cls_emb)
                 
                 # Concat: [N, 1024] + [N, 768] + [N, 4] = [N, 1796]
                 if n_det > 0:
