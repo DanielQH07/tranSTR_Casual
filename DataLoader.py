@@ -263,6 +263,7 @@ class VideoQADataset(Dataset):
         if isinstance(ff, np.ndarray):
             ff = torch.from_numpy(ff)
         ff = ff.float()
+        ff = torch.nan_to_num(ff, nan=0.0, posinf=0.0, neginf=0.0)
         
         nf = ff.shape[0]
         if nf > self.topK_frame:
@@ -276,6 +277,7 @@ class VideoQADataset(Dataset):
             of = self._load_gdino_object_features(vid)
         else:
             of = self._load_object_features(vid)
+        of = torch.nan_to_num(of.float(), nan=0.0, posinf=0.0, neginf=0.0)
         
         # Text features - cached or raw
         if self.use_cached and qns_key in self.text_features:
