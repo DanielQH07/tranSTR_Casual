@@ -2,3 +2,6 @@
 *.log
 *.tmp
 .DS_Store
+__pycache__
+prediction
+log
