@@ -2,6 +2,8 @@ from builtins import print, tuple
 from signal import pause
 import torch
 import torch.nn as nn
+import json
+import re
 # import random as rd
 import torch.nn.functional as F
 from itertools import chain
@@ -14,7 +16,7 @@ from einops import rearrange, repeat
 from networks.util import length_to_mask
 from networks.multimodal_transformer import TransformerEncoderLayer, TransformerEncoder, TransformerDecoderLayer, TransformerDecoder
 from networks.position_encoding import PositionEmbeddingSine1D
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoModelForCausalLM
 from networks.topk import HardtopK, PerturbedTopK
 try:
     from peft import LoraConfig, TaskType, get_peft_model
@@ -29,11 +31,37 @@ except ImportError:
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
 
 class VideoQAmodel(nn.Module):
-    def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
-                        objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
-                        frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False,
-                        use_lora=False, lora_r=8, lora_alpha=16, lora_dropout=0.1,
-                        lora_target_modules=None, **kwargs):
+    def __init__(
+        self,
+        text_encoder_type="roberta-base",
+        freeze_text_encoder=False,
+        n_query=5,
+        objs=20,
+        frames=16,
+        topK_frame=4,
+        topK_obj=5,
+        hard_eval=False,
+        frame_feat_dim=4096,
+        obj_feat_dim=2053,
+        use_grounding_dino=False,
+        use_lora=False,
+        lora_r=8,
+        lora_alpha=16,
+        lora_dropout=0.1,
+        lora_target_modules=None,
+        minilm_name="sentence-transformers/all-MiniLM-L6-v2",
+        freeze_minilm=True,
+        qwen_name="Qwen/Qwen2.5-VL-3B-Instruct",
+        use_qwen_lora=True,
+        qwen_lora_r=8,
+        qwen_lora_alpha=16,
+        qwen_lora_dropout=0.1,
+        qwen_lora_target_modules=None,
+        evidence_top_m=5,
+        use_qwen_causal_filter=False,
+        qwen_max_new_tokens=64,
+        **kwargs,
+    ):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -41,36 +69,52 @@ class VideoQAmodel(nn.Module):
         self.hard_eval = hard_eval
         self.use_grounding_dino = use_grounding_dino
         self.objs = objs
-        # text encoder
-        self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
-        self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
-
-        self.freeze_text_encoder = freeze_text_encoder
-        if freeze_text_encoder:
-            for p in self.text_encoder.parameters():
+        # MiniLM for question-guided frame selection
+        self.minilm = AutoModel.from_pretrained(minilm_name)
+        self.minilm_tokenizer = AutoTokenizer.from_pretrained(minilm_name)
+        self.freeze_minilm = freeze_minilm
+        if freeze_minilm:
+            for p in self.minilm.parameters():
                 p.requires_grad_(False)
+        minilm_hidden = getattr(self.minilm.config, "hidden_size", 384)
+        self.minilm_proj = nn.Linear(minilm_hidden, self.d_model)
+        # Optional cached text projection (legacy cached features are 768-d)
+        self.text_proj = nn.Linear(768, self.d_model)
 
-        self.use_lora = use_lora
-        if self.use_lora:
+        # Qwen for causal filtering + answer prediction
+        self.qwen = AutoModelForCausalLM.from_pretrained(qwen_name)
+        self.qwen_tokenizer = AutoTokenizer.from_pretrained(qwen_name)
+        if self.qwen_tokenizer.pad_token is None:
+            self.qwen_tokenizer.pad_token = self.qwen_tokenizer.eos_token
+
+        self.use_qwen_lora = use_qwen_lora
+        if self.use_qwen_lora:
             if get_peft_model is None:
                 raise ImportError(
-                    "PEFT is required for LoRA. Please install it with: pip install peft"
+                    "PEFT is required for Qwen LoRA. Please install it with: pip install peft"
                 )
-            if lora_target_modules is None:
-                lora_target_modules = ["query_proj", "key_proj", "value_proj"]
-            elif isinstance(lora_target_modules, str):
-                lora_target_modules = [m.strip() for m in lora_target_modules.split(",") if m.strip()]
+            if qwen_lora_target_modules is None:
+                qwen_lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            elif isinstance(qwen_lora_target_modules, str):
+                qwen_lora_target_modules = [m.strip() for m in qwen_lora_target_modules.split(",") if m.strip()]
 
-            lora_cfg = LoraConfig(
-                task_type=TaskType.FEATURE_EXTRACTION,
+            qwen_lora_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
                 inference_mode=False,
-                r=lora_r,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=lora_target_modules,
+                r=qwen_lora_r,
+                lora_alpha=qwen_lora_alpha,
+                lora_dropout=qwen_lora_dropout,
+                target_modules=qwen_lora_target_modules,
                 bias="none",
             )
-            self.text_encoder = get_peft_model(self.text_encoder, lora_cfg)
+            self.qwen = get_peft_model(self.qwen, qwen_lora_cfg)
+
+        self.qwen_hidden = getattr(self.qwen.config, "hidden_size", self.d_model)
+        self.evidence_projector = nn.Linear(self.d_model, self.qwen_hidden)
+        self.evidence_top_m = evidence_top_m
+        self.use_qwen_causal_filter = use_qwen_causal_filter
+        self.qwen_max_new_tokens = qwen_max_new_tokens
+        self._init_qwen_digit_ids()
 
         # Resize frame features to d_model
         self.frame_resize = FeatureResizer(
@@ -85,8 +129,8 @@ class VideoQAmodel(nn.Module):
 
         self.frame_topK, self.obj_topK = topK_frame, topK_obj
         
-        # Add text projection layer (BERT 768 -> d_model)
-        self.text_proj = nn.Linear(768, self.d_model)
+        # Evidence scoring for frame tokens
+        self.mem_evidence_head = nn.Linear(self.d_model, 1)
         self.frame_sorter = PerturbedTopK(self.frame_topK)
         
         # obj_sorter only if NOT using GroundingDINO (already filtered by text prompt)
@@ -104,7 +148,7 @@ class VideoQAmodel(nn.Module):
         # position embedding
         self.pos_encoder_1d = PositionEmbeddingSine1D()
 
-        # Generalized scoring heads
+        # Generalized scoring heads (legacy)
         self.answer_head = nn.Linear(self.d_model, 1)
         self.evidence_head = nn.Linear(self.d_model, 1)
 
@@ -127,6 +171,15 @@ class VideoQAmodel(nn.Module):
         self.classifier = self.answer_head
         self.verifier = self.evidence_head
 
+    def _init_qwen_digit_ids(self):
+        digit_ids = []
+        for digit in ["0", "1", "2", "3", "4"]:
+            tokens = self.qwen_tokenizer(digit, add_special_tokens=False).input_ids
+            if not tokens:
+                raise ValueError("Qwen tokenizer produced empty tokens for digit.")
+            digit_ids.append(tokens[0])
+        self.qwen_digit_token_ids = torch.tensor(digit_ids, dtype=torch.long)
+
     #     self._reset_parameters()
 
     # def _reset_parameters(self):
@@ -139,6 +192,128 @@ class VideoQAmodel(nn.Module):
         answer_score = self.answer_head(cand_feat).squeeze(-1)
         evidence_score = self.evidence_head(cand_feat).squeeze(-1)
         return cand_feat, answer_score, evidence_score
+
+    def _encode_question_minilm(self, text_queries, device):
+        tokenized = self.minilm_tokenizer(text_queries, padding="longest", return_tensors="pt")
+        tokenized = tokenized.to(device)
+        if self.freeze_minilm:
+            with torch.no_grad():
+                encoded = self.minilm(**tokenized).last_hidden_state
+            encoded = encoded.detach().clone()
+        else:
+            encoded = self.minilm(**tokenized).last_hidden_state
+        encoded = self.minilm_proj(encoded)
+        return encoded, tokenized.attention_mask.bool()
+
+    def _split_answers(self, ans_word_batch):
+        answers = []
+        for row in ans_word_batch:
+            row_answers = []
+            for cand in row:
+                if "[SEP]" in cand:
+                    row_answers.append(cand.split("[SEP]", 1)[1].strip())
+                else:
+                    row_answers.append(cand.strip())
+            while len(row_answers) < self.mc:
+                row_answers.append("")
+            answers.append(row_answers[: self.mc])
+        return answers
+
+    def _build_qwen_prompt(self, question, answers):
+        lines = [
+            "You are a video QA assistant.",
+            "Choose the correct option index (0-4) based on the question and evidence.",
+            f"Question: {question}",
+            "Options:",
+        ]
+        for i, a in enumerate(answers):
+            lines.append(f"{i}. {a}")
+        lines.append("Answer with a single digit: 0, 1, 2, 3, or 4.")
+        return "\n".join(lines)
+
+    def _build_causal_filter_prompt(self, question, evidence_indices):
+        lines = [
+            "You are a causal evidence selector.",
+            "Return a JSON object with key important_frames as a list of indices.",
+            "Evidence frames:",
+        ]
+        for idx in evidence_indices:
+            lines.append(f"[frame {idx}]")
+        lines.append(f"Question: {question}")
+        lines.append("Which evidence frames are causally relevant?")
+        return "\n".join(lines)
+
+    def _parse_causal_filter_output(self, text):
+        try:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                payload = json.loads(text[start : end + 1])
+                frames = payload.get("important_frames", [])
+                return [int(x) for x in frames if str(x).isdigit()]
+        except Exception:
+            pass
+
+        matches = re.findall(r"\d+", text)
+        return [int(x) for x in matches]
+
+    def _qwen_causal_filter(self, questions, evidence_indices_batch):
+        device = self.qwen.device
+        prompts = []
+        for question, evidence_indices in zip(questions, evidence_indices_batch):
+            prompts.append(self._build_causal_filter_prompt(question, evidence_indices))
+
+        tokenized = self.qwen_tokenizer(prompts, padding=True, return_tensors="pt")
+        tokenized = tokenized.to(device)
+        outputs = self.qwen.generate(
+            **tokenized,
+            max_new_tokens=self.qwen_max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+        )
+        decoded = self.qwen_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        filtered_indices = []
+        for evidence_indices, text in zip(evidence_indices_batch, decoded):
+            parsed = self._parse_causal_filter_output(text)
+            if not parsed:
+                filtered_indices.append(evidence_indices)
+                continue
+            filtered = [idx for idx in evidence_indices if idx in parsed]
+            filtered_indices.append(filtered if filtered else evidence_indices)
+        return filtered_indices
+
+    def _qwen_forward(self, evidence_tokens, questions, answers, target_ids=None):
+        device = evidence_tokens.device
+        prompts = [self._build_qwen_prompt(q, a) for q, a in zip(questions, answers)]
+        tokenized = self.qwen_tokenizer(prompts, padding=True, return_tensors="pt")
+        input_ids = tokenized.input_ids.to(device)
+        attention_mask = tokenized.attention_mask.to(device)
+
+        prompt_embeds = self.qwen.get_input_embeddings()(input_ids)
+        evidence_embeds = self.evidence_projector(evidence_tokens)
+        inputs_embeds = torch.cat([evidence_embeds, prompt_embeds], dim=1)
+
+        evidence_mask = torch.ones(
+            (evidence_tokens.size(0), evidence_tokens.size(1)),
+            dtype=attention_mask.dtype,
+            device=device,
+        )
+        attention_mask = torch.cat([evidence_mask, attention_mask], dim=1)
+
+        outputs = self.qwen(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        logits = outputs.logits[:, -1, :]
+        digit_ids = self.qwen_digit_token_ids.to(device)
+        digit_logits = logits.index_select(-1, digit_ids)
+
+        loss = None
+        if target_ids is not None:
+            loss = F.cross_entropy(digit_logits, target_ids)
+        return digit_logits, loss
 
     def pool_memory(self, mem, mem_mask=None):
         # Mean-pool by default to keep behavior stable and lightweight.
@@ -218,11 +393,13 @@ class VideoQAmodel(nn.Module):
             aux["fused_score"] = aux["answer_score"]
         return aux
 
-    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None):
+    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None, ans_id=None):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
         :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
-        :param qns: ('what are three people sitting on?', 'what is a family having?')
+        :param qns_word: ('what are three people sitting on?', 'what is a family having?')
+        :param ans_word: list of answer candidates per sample
+        :param ans_id: [bs] target answer indices (0-4)
         :return:
         """
         # Size
@@ -232,8 +409,8 @@ class VideoQAmodel(nn.Module):
         # Resize frame features to d_model
         frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
         
-        # encode q
-        q_local, q_mask = self.forward_text(list(qns_word), device)  # [batch, q_len, d_model]
+        # encode q via MiniLM
+        q_local, q_mask = self._encode_question_minilm(list(qns_word), device)
 
 
         #### encode v
@@ -302,43 +479,59 @@ class VideoQAmodel(nn.Module):
                             pos = self.pos_encoder_1d(frame_qns_mask.bool(), self.d_model)
                             ) # b,16,d
         
-        # encode ans
-        a_seq, _ = self.forward_text(list(chain(*ans_word)), device, has_ans=True)
-        a_seq = rearrange(a_seq, '(n b) t c -> b n t c', b=B)
-        tgt = a_seq[:,:,0,:] # [CLS] # [batch, n_query, d_model]
-        out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
+        # evidence scoring over frame tokens
+        frame_tokens = mem[:, : self.frame_topK, :]
+        evidence_scores = self.mem_evidence_head(frame_tokens).squeeze(-1)
+        top_m = min(self.evidence_top_m, frame_tokens.size(1))
+        top_idx = torch.topk(evidence_scores, k=top_m, dim=1).indices
+        idx_expand = top_idx.unsqueeze(-1).expand(-1, -1, frame_tokens.size(-1))
+        evidence_tokens = frame_tokens.gather(1, idx_expand)
 
-        # candidate decoding
-        cand_feat, answer_score, evidence_score = self.decode_candidates(out)
+        if self.use_qwen_causal_filter and not self.training:
+            evidence_indices_batch = top_idx.detach().cpu().tolist()
+            filtered_indices = self._qwen_causal_filter(list(qns_word), evidence_indices_batch)
+            max_keep = max(len(x) for x in filtered_indices)
+            max_keep = max(max_keep, 1)
+            filtered_tokens = []
+            filtered_idx_tensor = []
+            for row_idx, keep in enumerate(filtered_indices):
+                keep = keep[:max_keep]
+                if len(keep) < max_keep:
+                    keep = keep + keep[: max_keep - len(keep)]
+                keep_tensor = torch.tensor(keep, device=device, dtype=top_idx.dtype)
+                filtered_idx_tensor.append(keep_tensor)
+                token_idx = keep_tensor.unsqueeze(-1).expand(-1, frame_tokens.size(-1))
+                filtered_tokens.append(frame_tokens[row_idx].gather(0, token_idx))
+            top_idx = torch.stack(filtered_idx_tensor, dim=0)
+            evidence_tokens = torch.stack(filtered_tokens, dim=0)
+
+        answers = self._split_answers(ans_word)
+        target_ids = None
+        if ans_id is not None:
+            target_ids = ans_id.to(device)
+        qwen_logits, qwen_loss = self._qwen_forward(
+            evidence_tokens,
+            list(qns_word),
+            answers,
+            target_ids=target_ids,
+        )
+
         mem_pool = self.pool_memory(mem, mem_mask=frame_qns_mask)
-
-        # Backward-compatible names
-        logits = answer_score
-        verifier_logits = evidence_score
         aux = {
-                "cand_feat": cand_feat,
-                "answer_score": answer_score,
-                "evidence_score": evidence_score,
-                "mem": mem,
-                "mem_pool": mem_pool,
-                "logits": logits,
-                "verifier_logits": verifier_logits
-            }
-
-        if q_family_id is not None:
-            if not isinstance(q_family_id, torch.Tensor):
-                q_family_id = torch.tensor(q_family_id, dtype=torch.long, device=logits.device)
-            q_family_id = q_family_id.to(logits.device).long().view(-1)
-            k_feat = self._normalize_knowledge_feat(knowledge_feat, cand_feat)
-            knowledge_score = self.score_knowledge_support(cand_feat, mem_pool, k_feat, q_family_id)
-            aux["knowledge_score"] = knowledge_score
-            aux["fused_score"] = answer_score + self.lambda_knowledge * knowledge_score
+            "mem": mem,
+            "mem_pool": mem_pool,
+            "evidence_scores": evidence_scores,
+            "evidence_top_idx": top_idx,
+            "evidence_tokens": evidence_tokens,
+            "qwen_logits": qwen_logits,
+            "qwen_loss": qwen_loss,
+        }
 
         if return_aux:
             return aux
-        return logits
+        return qwen_logits
     
-    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False, q_family_id=None, knowledge_feat=None):
+    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False, q_family_id=None, knowledge_feat=None, ans_id=None):
         """
         Forward pass using pre-extracted text features (bypasses DeBERTa).
         
@@ -457,30 +650,7 @@ class VideoQAmodel(nn.Module):
         
 
     def forward_text(self, text_queries, device, has_ans=False):
-        """
-        text_queries : list of question str 
-        out: text_embedding: bs, len, dim
-            mask: bs, len (bool) [1,1,1,1,0,0]
-        """
-        tokenized_queries = self.tokenizer(text_queries, padding='longest', return_tensors='pt')
-        # tokenized_queries = self.tokenizer(text_queries, padding='max_length', 
-        #                                     max_length=self.qa_max_len if has_ans else self.q_max_len, 
-        #                                     return_tensors='pt')
-        tokenized_queries = tokenized_queries.to(device)
-        
-        # Use no_grad when freezing (inference_mode causes issues with backprop)
-        if self.freeze_text_encoder:
-            with torch.no_grad():
-                encoded_text = self.text_encoder(**tokenized_queries).last_hidden_state
-            # Detach and clone to allow gradient flow through text_proj
-            encoded_text = encoded_text.detach().clone()
-        else:
-            encoded_text = self.text_encoder(**tokenized_queries).last_hidden_state
-        
-        # Project text from 768 to d_model
-        encoded_text = self.text_proj(encoded_text)
-
-        return encoded_text, tokenized_queries.attention_mask.bool()
+        return self._encode_question_minilm(text_queries, device)
     
 
 
