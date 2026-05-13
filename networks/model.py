@@ -290,9 +290,8 @@ class VideoQAmodel(nn.Module):
         input_ids = tokenized.input_ids.to(device)
         attention_mask = tokenized.attention_mask.to(device)
 
-        qwen_dtype = self.qwen.get_input_embeddings().weight.dtype
-        prompt_embeds = self.qwen.get_input_embeddings()(input_ids).to(qwen_dtype)
-        evidence_embeds = self.evidence_projector(evidence_tokens).to(qwen_dtype)
+        prompt_embeds = self.qwen.get_input_embeddings()(input_ids)
+        evidence_embeds = self.evidence_projector(evidence_tokens)
         inputs_embeds = torch.cat([evidence_embeds, prompt_embeds], dim=1)
 
         evidence_mask = torch.ones(
