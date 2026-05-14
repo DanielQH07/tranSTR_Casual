@@ -266,11 +266,43 @@ class VideoQAmodel(nn.Module):
         out: text_embedding: bs, len, dim
             mask: bs, len (bool) [1,1,1,1,0,0]
         """
-        tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding='longest', return_tensors='pt')
-        # tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding='max_length', 
-        #                                                     max_length=self.qa_max_len if has_ans else self.q_max_len, 
-        #                                                     return_tensors='pt')
-        tokenized_queries = tokenized_queries.to(device)
+        try:
+            tokenized_queries = self.tokenizer(
+                text_queries,
+                padding='longest',
+                truncation=True,
+                return_tensors='pt'
+            )
+        except Exception:
+            encoded_items = []
+            for query in text_queries:
+                item = self.tokenizer.encode_plus(query, truncation=True, return_tensors='pt')
+                encoded_items.append(item)
+
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            max_len = max(item['input_ids'].shape[1] for item in encoded_items)
+
+            input_ids = []
+            attention_mask = []
+            for item in encoded_items:
+                ids = item['input_ids'].squeeze(0)
+                mask = item['attention_mask'].squeeze(0)
+                pad_n = max_len - ids.shape[0]
+                if pad_n > 0:
+                    ids = torch.cat([ids, torch.full((pad_n,), pad_id, dtype=ids.dtype)])
+                    mask = torch.cat([mask, torch.zeros((pad_n,), dtype=mask.dtype)])
+                input_ids.append(ids)
+                attention_mask.append(mask)
+
+            tokenized_queries = {
+                'input_ids': torch.stack(input_ids, dim=0),
+                'attention_mask': torch.stack(attention_mask, dim=0),
+            }
+
+        if hasattr(tokenized_queries, 'to'):
+            tokenized_queries = tokenized_queries.to(device)
+        else:
+            tokenized_queries = {k: v.to(device) for k, v in tokenized_queries.items()}
         
         # Use no_grad when freezing (inference_mode causes issues with backprop)
         if self.freeze_text_encoder:
@@ -284,7 +316,8 @@ class VideoQAmodel(nn.Module):
         # Project text from 768 to d_model
         encoded_text = self.text_proj(encoded_text)
 
-        return encoded_text, tokenized_queries.attention_mask.bool()
+        attention_mask = tokenized_queries['attention_mask'] if isinstance(tokenized_queries, dict) else tokenized_queries.attention_mask
+        return encoded_text, attention_mask.bool()
     
 
 
