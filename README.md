@@ -64,8 +64,8 @@ Tập dữ liệu gốc lấy từ youtube dùng cho việc trích xuất lại 
 
 ### 4.1 Pretrained / trained weights
 
-- Best checkpoint link: `https://drive.google.com/file/d/1yHcW-DNo_xhGbjCdVNagpS6ILbZBC5r1/view?usp=sharing`
-- Last checkpoint link: `https://drive.google.com/drive/folders/1DHcD8v1p0MBW-n-G35K9IqGdGIn5Klk-?usp=sharing`
+- Best checkpoint link: `https://drive.google.com/file/d/1yHcW-DNo_xhGbjCdVNagpS6ILbZBC5r1/view?usp=drive_link`
+- Last checkpoint link: `https://drive.google.com/file/d/1ZrAN6h16Oct9x-mm1lOrKpadR_k-5_PG/view?usp=drive_link`
 
 ### 4.2 Vị trí đặt weight local
 
