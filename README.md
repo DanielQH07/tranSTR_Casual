@@ -22,13 +22,13 @@ causalvid/
 ├── networks/
 │   └── model.py
 ├── utils/
-├── trainingtranstr.ipynb
+├── tranSTR.ipynb
 └── README.md
 ```
 
 ## 3) Input dataset
 
-Bạn có thể dùng Kaggle datasets hoặc đường dẫn local. Code hiện tại trong notebook `trainingtranstr.ipynb` đang dùng KaggleHub để tự resolve đường dẫn.
+Bạn có thể dùng Kaggle datasets hoặc đường dẫn local. Code hiện tại trong notebook `tranSTR.ipynb` đang dùng KaggleHub để tự resolve đường dẫn.
 
 ### 3.1 Dataset links (điền/tùy chỉnh)
 
@@ -94,7 +94,7 @@ pip install -U kagglehub wandb huggingface_hub
 
 Notebook chính: `tranSTR.ipynb`
 Link colab mẫu: `https://colab.research.google.com/drive/1VvCL711old__GnPnazBoXVN2yZ39ULhl?usp=sharing`
-Notebook inference: `inference.ipynb`
+Notebook inference: `inference_transtr.ipynb`
 Link kaggle inference mẫu: `https://www.kaggle.com/code/thnhinhoquc/inference-transtr`
 
 Flow:
@@ -105,7 +105,7 @@ Flow:
 - Evaluate test set
 
 Single-video inference:
-- Trong `inference.ipynb`, chạy thêm `CELL 7: Single-video inference`.
+- Trong `inference_transtr.ipynb`, chạy thêm `CELL 7: Single-video inference`.
 - Đặt `VIDEO_ID` (vd `2VBmRPrfNZY_000000_000010`).
 - Cell sẽ tự download raw video từ dataset `danielq07/causal-vidqa-raw-video-full`, hiển thị video, và xuất kết quả dự đoán riêng cho video đó.
 
