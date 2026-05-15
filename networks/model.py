@@ -31,6 +31,8 @@ class VideoQAmodel(nn.Module):
         encoder_dropout = kwargs['encoder_dropout']
         self.mc = n_query
         self.hard_eval = hard_eval
+        self.q_max_len = kwargs.get('q_max_len', 64)
+        self.qa_max_len = kwargs.get('qa_max_len', 96)
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -98,6 +100,13 @@ class VideoQAmodel(nn.Module):
         
         # encode q
         q_local, q_mask = self.forward_text(list(qns_word), device)  # [batch, q_len, d_model]
+        if frame_feat.size(-1) != self.d_model or q_local.size(-1) != self.d_model:
+            raise RuntimeError(
+                "Feature dimension mismatch before frame decoder: "
+                f"frame={frame_feat.size(-1)}, question={q_local.size(-1)}, "
+                f"expected d_model={self.d_model}. Recreate/reload the model with one "
+                "consistent d_model and restart the notebook kernel if model.py changed."
+            )
 
 
         #### encode v
@@ -181,6 +190,7 @@ class VideoQAmodel(nn.Module):
             text_queries,
             padding='longest',
             truncation=True,
+            max_length=self.qa_max_len if has_ans else self.q_max_len,
             return_tensors='pt'
         )
         # tokenized_queries = self.tokenizer.batch_encode_plus(text_queries, padding='max_length', 
