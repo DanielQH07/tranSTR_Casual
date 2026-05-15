@@ -13,8 +13,9 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import RobertaTokenizerFast
 
 class VideoQADataset(Dataset):
-    def __init__(self, split, n_query=5, obj_num=10, sample_list_path="/data/vqa/causal/anno",\
-         video_feature_path="/region_feat_aln", object_feature_path="/object_feat", split_dir=None, topK_frame=16):
+    def __init__(self, split, n_query=5, obj_num=10, sample_list_path="/data/vqa/causal/anno",
+                 video_feature_path="/region_feat_aln", object_feature_path="/object_feat", split_dir=None,
+                 topK_frame=16, max_samples=None, verbose=False):
         super(VideoQADataset, self).__init__()
         self.split = split
         self.mc = n_query
@@ -22,6 +23,8 @@ class VideoQADataset(Dataset):
         self.video_feature_path = video_feature_path
         self.object_feature_path = object_feature_path
         self.topK_frame = topK_frame
+        self.max_samples = max_samples
+        self.verbose = verbose
 
         # 1. Load Split Video IDs
         valid_vids = set()
