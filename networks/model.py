@@ -40,6 +40,11 @@ class VideoQAmodel(nn.Module):
             for p in self.text_encoder.parameters():
                 p.requires_grad_(False)
 
+        self.text_resize = FeatureResizer(
+            input_feat_size=self.text_encoder.config.hidden_size,
+            output_feat_size=self.d_model,
+            dropout=kwargs['dropout'])
+
         # Resize frame features to d_model
         self.frame_resize = FeatureResizer(
             input_feat_size=frame_feat_dim,
@@ -184,6 +189,8 @@ class VideoQAmodel(nn.Module):
         tokenized_queries = tokenized_queries.to(device)
         with torch.inference_mode(mode=self.freeze_text_encoder):
             encoded_text = self.text_encoder(**tokenized_queries).last_hidden_state
+
+        encoded_text = self.text_resize(encoded_text)
 
         return encoded_text, tokenized_queries.attention_mask.bool()
     
