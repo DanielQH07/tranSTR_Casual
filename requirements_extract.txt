@@ -1,0 +1,34 @@
+# Core runtime for extract_feature.py
+numpy>=1.23,<2.0
+opencv-python>=4.8
+tqdm>=4.64
+Pillow>=9.5
+
+# PyTorch stack.
+# For CUDA machines, prefer installing torch/torchvision from the official PyTorch
+# command matching your CUDA version before installing this file.
+torch>=2.1
+torchvision>=0.16
+
+# GroundingDINO and DeBERTa through Hugging Face Transformers
+transformers>=4.40
+accelerate>=0.25
+huggingface_hub>=0.20
+sentencepiece>=0.1.99
+protobuf>=3.20
+
+# Video decoding. extract_feature.py falls back to cv2 if decord is unavailable.
+decord>=0.6.0
+
+# Prompt noun extraction. If the model package install fails, run:
+# python -m spacy download en_core_web_sm
+spacy>=3.6
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+
+# Faster R-CNN ROI feature extraction.
+# Detectron2 is platform/CUDA/PyTorch sensitive and must be installed after
+# torch/torchvision already exist in the active environment. Install it manually:
+# pip install --no-build-isolation "git+https://github.com/facebookresearch/detectron2.git"
+cython
+pyyaml
+pycocotools>=2.0.7
