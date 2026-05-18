@@ -24,7 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface to
 
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
-                        objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
+                        objs=20, frames=16, topK_frame=5, topK_obj=12, hard_eval=False, 
                         frame_feat_dim=4096, obj_feat_dim=2053, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
@@ -368,8 +368,8 @@ if __name__ == "__main__":
     parser.add_argument("-vid_dim", "-vd", type=int, help="vis dim", default=2048) 
     parser.add_argument('-vid_encoder_type', "-ve", default='cnn',choices=['rnn', 'cnn'], type=str)
     parser.add_argument("-hard_eval", "-hd", action="store_true", help="hard selection during inference")
-    parser.add_argument("-topK_frame", "-fk", type=int, help="word dim ", default=8)   
-    parser.add_argument("-topK_obj", "-ok", type=int, help="word dim ", default=5) 
+    parser.add_argument("-topK_frame", "-fk", type=int, help="word dim ", default=5)   
+    parser.add_argument("-topK_obj", "-ok", type=int, help="word dim ", default=12) 
 
     # transformer
     parser.add_argument("-trans_hid", type=int, help="hidden dim of ffn in transfomer", default=2048) 
