@@ -1,5 +1,4 @@
 from builtins import print, tuple
-from signal import pause
 import torch
 import torch.nn as nn
 # import random as rd
@@ -78,6 +77,12 @@ class VideoQAmodel(nn.Module):
             output_feat_size=self.d_model,
             dropout=kwargs['dropout'])
 
+        # When using GroundingDINO+FasterRCNN raw features (2820-d), the three
+        # blocks (FRCNN ROI 2048, DeBERTa cls 768, bbox 4) live on different
+        # scales. Apply a learned LayerNorm BEFORE the resize Linear so the
+        # network can recover scale info instead of forcing L2-norm in the
+        # data pipeline (which destroys magnitude).
+        self.obj_pre_norm = nn.LayerNorm(obj_feat_dim) if use_grounding_dino else nn.Identity()
         self.obj_resize = FeatureResizer(
             input_feat_size=obj_feat_dim,
             output_feat_size=self.d_model, 
@@ -258,6 +263,7 @@ class VideoQAmodel(nn.Module):
 
         # obj
         obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
+        obj_feat = self.obj_pre_norm(obj_feat)  # LayerNorm only when use_grounding_dino, else Identity
         obj_local = self.obj_resize(obj_feat)
         
         # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
@@ -383,6 +389,7 @@ class VideoQAmodel(nn.Module):
         
         # Object processing
         obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B, self.frame_topK, O, -1)
+        obj_feat = self.obj_pre_norm(obj_feat)
         obj_local = self.obj_resize(obj_feat)
         
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
