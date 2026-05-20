@@ -18,6 +18,11 @@ FAMILY_TO_ID = {
     'counterfactual_reason': 5,
 }
 
+GDINO_ROI_DIM = 2048
+GDINO_CLS_DIM = 768
+GDINO_BBOX_DIM = 4
+GDINO_OBJ_DIM = GDINO_ROI_DIM + GDINO_CLS_DIM + GDINO_BBOX_DIM
+
 
 class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
@@ -310,12 +315,9 @@ class VideoQADataset(Dataset):
             torch.Tensor: [topK_frame, obj_num, 2820] = 2048 + 768 + 4
             (Raw concat — LayerNorm is applied inside the model.)
         """
-        ROI_DIM = 2048
-        CLS_DIM = 768
-        GDINO_DIM = ROI_DIM + CLS_DIM + 4  # 2820
         pkl_path = self.gdino_feature_map.get(vid)
         if not pkl_path or not osp.exists(pkl_path):
-            return torch.zeros(self.topK_frame, self.obj_num, GDINO_DIM)
+            return torch.zeros(self.topK_frame, self.obj_num, GDINO_OBJ_DIM)
 
         try:
             with open(pkl_path, 'rb') as f:
@@ -336,13 +338,21 @@ class VideoQADataset(Dataset):
             for idx in indices:
                 frame_dict = frames_data[idx]
                 roi_feats = np.asarray(frame_dict.get('roi_features',
-                                       np.zeros((0, ROI_DIM), dtype=np.float32)), dtype=np.float32)
+                                       np.zeros((0, GDINO_ROI_DIM), dtype=np.float32)), dtype=np.float32)
                 cls_emb = np.asarray(frame_dict.get('class_text_embedding',
-                                     np.zeros((0, CLS_DIM), dtype=np.float32)), dtype=np.float32)
+                                     np.zeros((0, GDINO_CLS_DIM), dtype=np.float32)), dtype=np.float32)
                 boxes_orig = np.asarray(frame_dict.get('boxes_xyxy_orig',
                                        np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)
 
+                if roi_feats.ndim == 1:
+                    roi_feats = roi_feats.reshape(1, -1)
+                if cls_emb.ndim == 1:
+                    cls_emb = cls_emb.reshape(1, -1)
+                if boxes_orig.ndim == 1:
+                    boxes_orig = boxes_orig.reshape(1, -1)
+
                 n_det = len(roi_feats)
+                roi_feats = self._fit_last_dim(roi_feats, GDINO_ROI_DIM)
 
                 # Align cls_emb length with roi_feats: truncate/pad rather than silent zero-out
                 if len(cls_emb) != n_det:
@@ -351,8 +361,9 @@ class VideoQADataset(Dataset):
                     else:
                         pad_n = n_det - len(cls_emb)
                         cls_emb = np.concatenate(
-                            [cls_emb, np.zeros((pad_n, CLS_DIM), dtype=np.float32)], axis=0
+                            [cls_emb, np.zeros((pad_n, cls_emb.shape[-1]), dtype=np.float32)], axis=0
                         )
+                cls_emb = self._fit_last_dim(cls_emb, GDINO_CLS_DIM)
 
                 # Same for boxes
                 if len(boxes_orig) != n_det:
@@ -363,6 +374,7 @@ class VideoQADataset(Dataset):
                         boxes_orig = np.concatenate(
                             [boxes_orig, np.zeros((pad_n, 4), dtype=np.float32)], axis=0
                         )
+                boxes_orig = self._fit_last_dim(boxes_orig, GDINO_BBOX_DIM)
 
                 # Normalize bbox to [0, 1]
                 if n_det > 0:
@@ -381,7 +393,7 @@ class VideoQADataset(Dataset):
                 if n_det > 0:
                     obj_feat = np.concatenate([roi_feats, cls_emb, boxes_norm], axis=-1)
                 else:
-                    obj_feat = np.zeros((0, GDINO_DIM), dtype=np.float32)
+                    obj_feat = np.zeros((0, GDINO_OBJ_DIM), dtype=np.float32)
 
                 obj_feat = torch.from_numpy(obj_feat).float()
 
@@ -390,19 +402,38 @@ class VideoQADataset(Dataset):
                 if N > self.obj_num:
                     obj_feat = obj_feat[:self.obj_num]
                 elif N < self.obj_num:
-                    pad = torch.zeros(self.obj_num - N, GDINO_DIM)
+                    pad = torch.zeros(self.obj_num - N, GDINO_OBJ_DIM)
                     obj_feat = torch.cat([obj_feat, pad], dim=0)
 
                 objs.append(obj_feat)
 
             # Pad frames if needed
             while len(objs) < self.topK_frame:
-                objs.append(torch.zeros(self.obj_num, GDINO_DIM))
+                objs.append(torch.zeros(self.obj_num, GDINO_OBJ_DIM))
 
             return torch.stack(objs)  # [topK_frame, obj_num, 2820]
 
         except Exception:
-            return torch.zeros(self.topK_frame, self.obj_num, GDINO_DIM)
+            return torch.zeros(self.topK_frame, self.obj_num, GDINO_OBJ_DIM)
+
+    @staticmethod
+    def _fit_last_dim(array, target_dim):
+        """Pad or truncate feature arrays so DataLoader batches always stack."""
+        array = np.asarray(array, dtype=np.float32)
+        if array.ndim == 0:
+            array = array.reshape(1, 1)
+        if array.ndim == 1:
+            array = array.reshape(1, -1)
+
+        current_dim = array.shape[-1]
+        if current_dim == target_dim:
+            return array
+        if current_dim > target_dim:
+            return array[..., :target_dim]
+
+        pad_width = [(0, 0)] * array.ndim
+        pad_width[-1] = (0, target_dim - current_dim)
+        return np.pad(array, pad_width, mode='constant')
 
     def _load_object_features(self, vid):
         objs = []

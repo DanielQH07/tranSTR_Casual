@@ -40,6 +40,7 @@ class VideoQAmodel(nn.Module):
         self.hard_eval = hard_eval
         self.use_grounding_dino = use_grounding_dino
         self.objs = objs
+        self.obj_feat_dim = obj_feat_dim
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -206,6 +207,16 @@ class VideoQAmodel(nn.Module):
 
         return knowledge_feat
 
+    def _fit_obj_feat_dim(self, obj_feat):
+        """Pad or truncate object features to the width expected by obj_resize."""
+        expected_dim = self.obj_resize.fc.in_features
+        current_dim = obj_feat.size(-1)
+        if current_dim == expected_dim:
+            return obj_feat
+        if current_dim > expected_dim:
+            return obj_feat[..., :expected_dim]
+        return F.pad(obj_feat, (0, expected_dim - current_dim))
+
     def forward_with_knowledge(self, frame_feat, obj_feat, qns_word, ans_word, q_family_id, knowledge_feat=None):
         """Knowledge-aware forward that returns detailed scores for reranking/training."""
         aux = self.forward(
@@ -263,6 +274,7 @@ class VideoQAmodel(nn.Module):
 
         # obj
         obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
+        obj_feat = self._fit_obj_feat_dim(obj_feat)
         obj_feat = self.obj_pre_norm(obj_feat)  # LayerNorm only when use_grounding_dino, else Identity
         obj_local = self.obj_resize(obj_feat)
         
@@ -389,6 +401,7 @@ class VideoQAmodel(nn.Module):
         
         # Object processing
         obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B, self.frame_topK, O, -1)
+        obj_feat = self._fit_obj_feat_dim(obj_feat)
         obj_feat = self.obj_pre_norm(obj_feat)
         obj_local = self.obj_resize(obj_feat)
         
@@ -402,16 +415,19 @@ class VideoQAmodel(nn.Module):
             output_attentions=True
         )
         
-        # TopK object selection
-        if self.training:
-            idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+        if self.use_grounding_dino:
+            obj_local = obj_local.view(B, self.frame_topK, O, -1)
         else:
-            if self.hard_eval:
-                idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
-            else:
+            # TopK object selection
+            if self.training:
                 idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
-        
-        obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+            else:
+                if self.hard_eval:
+                    idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
+                else:
+                    idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+            
+            obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
         
         # Hierarchy grouping
         frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
