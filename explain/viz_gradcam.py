@@ -69,10 +69,10 @@ def plot_frame_gradcam(
                 spine.set_edgecolor(_HIGHLIGHT)
                 spine.set_linewidth(4)
             title_color = _HIGHLIGHT
-            tag = f"F{i} ★ cam={cam[i]:.3f}"
+            tag = f"F{i} ★ cam={cam[i]:.2f}"
         else:
             title_color = "#6e7681"
-            tag = f"F{i}  cam={cam[i]:.3f}"
+            tag = f"F{i}  cam={cam[i]:.2f}"
         ax.imshow(blended)
         ax.set_title(tag, fontsize=9, color=title_color)
         ax.set_xticks([])
@@ -178,7 +178,7 @@ def plot_object_gradcam(
 
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, box_line)
             raw_label = labels[oi] if oi < len(labels) else f"obj{oi}"
-            tag = f"#{rank + 1} {raw_label} cam={all_scores[oi]:.3f}"
+            tag = f"#{rank + 1} {raw_label} cam={all_scores[oi]:.2f}"
             (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thick)
             pad = int(th * 0.35)
             bg_y1 = max(0, y1 - th - pad * 2)
@@ -232,7 +232,7 @@ def plot_question_token_gradcam(
         tok = tokens[i].replace("Ġ", " ").replace("▁", " ")
         spans.append(
             f"<span style='background:rgb({r},{g},{b}); color:#fff; padding:2px 4px; "
-            f"margin:1px; border-radius:3px;' title='cam={cam[i]:.3f}'>{tok}</span>"
+            f"margin:1px; border-radius:3px;' title='cam={cam[i]:.2f}'>{tok}</span>"
         )
 
     pred_html = ""

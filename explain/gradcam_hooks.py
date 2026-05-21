@@ -130,6 +130,8 @@ class MultiTargetGradCAM:
         obj_feat_top = (
             obj_feat.flatten(-2, -1).transpose(1, 2) @ idx_frame
         ).transpose(1, 2).view(B, model.frame_topK, O, -1)
+        obj_feat_top = model._fit_obj_feat_dim(obj_feat_top)
+        obj_feat_top = model.obj_pre_norm(obj_feat_top)
         obj_local_in = model.obj_resize(obj_feat_top)
 
         q_local_rep = q_local.repeat_interleave(model.frame_topK, dim=0)
