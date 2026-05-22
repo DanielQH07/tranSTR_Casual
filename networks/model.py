@@ -1,4 +1,5 @@
 from builtins import print, tuple
+import math
 import torch
 import torch.nn as nn
 # import random as rd
@@ -32,7 +33,9 @@ class VideoQAmodel(nn.Module):
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
                         frame_feat_dim=4096, obj_feat_dim=2053, use_grounding_dino=False,
                         use_lora=False, lora_r=8, lora_alpha=16, lora_dropout=0.1,
-                        lora_target_modules=None, **kwargs):
+                        lora_target_modules=None,
+                        obj_use_bbox_pos_embed=True, obj_hard_gather_from_frame=True,
+                        obj_bbox_dim=4, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -78,16 +81,39 @@ class VideoQAmodel(nn.Module):
             output_feat_size=self.d_model,
             dropout=kwargs['dropout'])
 
-        # When using GroundingDINO+FasterRCNN raw features (2820-d), the three
-        # blocks (FRCNN ROI 2048, DeBERTa cls 768, bbox 4) live on different
-        # scales. Apply a learned LayerNorm BEFORE the resize Linear so the
-        # network can recover scale info instead of forcing L2-norm in the
-        # data pipeline (which destroys magnitude).
-        self.obj_pre_norm = nn.LayerNorm(obj_feat_dim) if use_grounding_dino else nn.Identity()
-        self.obj_resize = FeatureResizer(
-            input_feat_size=obj_feat_dim,
-            output_feat_size=self.d_model, 
-            dropout=kwargs['dropout'])
+        # ---- Object feature path ----
+        # When using GroundingDINO+FasterRCNN raw features (2820-d = ROI 2048 +
+        # DeBERTa cls 768 + bbox 4), a single LayerNorm(2820) lets the 2816
+        # semantic dims dominate the 4 bbox dims and effectively erases spatial
+        # information. We instead split:
+        #   sem  = [..., :2816]  -> LayerNorm + Linear -> d_model
+        #   bbox = [..., -4:]    -> 2D sinusoidal pos embed -> d_model
+        # Then sum + LayerNorm. Controlled by obj_use_bbox_pos_embed.
+        self.obj_bbox_dim = int(obj_bbox_dim)
+        self.obj_use_bbox_pos_embed = bool(obj_use_bbox_pos_embed) and bool(use_grounding_dino)
+        self.obj_hard_gather_from_frame = bool(obj_hard_gather_from_frame) and bool(use_grounding_dino)
+
+        if self.obj_use_bbox_pos_embed:
+            sem_dim = int(obj_feat_dim) - self.obj_bbox_dim
+            if sem_dim <= 0:
+                raise ValueError(f"obj_feat_dim ({obj_feat_dim}) must be > obj_bbox_dim ({self.obj_bbox_dim})")
+            if self.d_model % 8 != 0:
+                raise ValueError(f"d_model must be divisible by 8 for BBoxPosEmbed2D; got {self.d_model}")
+            # Identity kept for backward-compat with checkpoint loading code paths.
+            self.obj_pre_norm = nn.Identity()
+            self.obj_sem_norm = nn.LayerNorm(sem_dim)
+            self.obj_resize = FeatureResizer(
+                input_feat_size=sem_dim,
+                output_feat_size=self.d_model,
+                dropout=kwargs['dropout'])
+            self.bbox_pos_embed = BBoxPosEmbed2D(d_model=self.d_model, dropout=kwargs['dropout'])
+            self.obj_post_pos_norm = nn.LayerNorm(self.d_model)
+        else:
+            self.obj_pre_norm = nn.LayerNorm(obj_feat_dim) if use_grounding_dino else nn.Identity()
+            self.obj_resize = FeatureResizer(
+                input_feat_size=obj_feat_dim,
+                output_feat_size=self.d_model, 
+                dropout=kwargs['dropout'])
 
         self.frame_topK, self.obj_topK = topK_frame, topK_obj
         
@@ -208,14 +234,53 @@ class VideoQAmodel(nn.Module):
         return knowledge_feat
 
     def _fit_obj_feat_dim(self, obj_feat):
-        """Pad or truncate object features to the width expected by obj_resize."""
-        expected_dim = self.obj_resize.fc.in_features
+        """Pad or truncate object features to the width expected downstream.
+        When obj_use_bbox_pos_embed is True, target = sem_dim + bbox_dim (e.g. 2816+4=2820);
+        otherwise target = obj_resize.fc.in_features.
+        """
+        if self.obj_use_bbox_pos_embed:
+            expected_dim = self.obj_resize.fc.in_features + self.obj_bbox_dim
+        else:
+            expected_dim = self.obj_resize.fc.in_features
         current_dim = obj_feat.size(-1)
         if current_dim == expected_dim:
             return obj_feat
         if current_dim > expected_dim:
             return obj_feat[..., :expected_dim]
         return F.pad(obj_feat, (0, expected_dim - current_dim))
+
+    def _encode_objects(self, obj_feat):
+        """Convert raw object features to obj_local of dim d_model.
+        Splits bbox into a 2D sinusoidal positional embedding when
+        obj_use_bbox_pos_embed is True; otherwise uses a single LN+Linear path.
+        """
+        if self.obj_use_bbox_pos_embed:
+            sem = obj_feat[..., :-self.obj_bbox_dim]
+            bbox = obj_feat[..., -self.obj_bbox_dim:]
+            sem = self.obj_sem_norm(sem)
+            sem_proj = self.obj_resize(sem)
+            bbox_emb = self.bbox_pos_embed(bbox)
+            return self.obj_post_pos_norm(sem_proj + bbox_emb)
+        obj_feat = self.obj_pre_norm(obj_feat)
+        return self.obj_resize(obj_feat)
+
+    def _select_obj_by_frame(self, obj_feat, idx_frame):
+        """Pick objects of the top-K selected frames.
+        - Hard path (obj_hard_gather_from_frame=True): gather using argmax of
+          idx_frame; preserves per-frame spatial correspondence (essential for
+          GroundingDINO bbox features).
+        - Soft path: original soft-mix via matmul (mixes objects across frames).
+        idx_frame: [B, F, K], obj_feat: [B, F, O, D] -> returns [B, K, O, D].
+        """
+        B, F, O, D = obj_feat.shape
+        K = self.frame_topK
+        if self.obj_hard_gather_from_frame:
+            with torch.no_grad():
+                sel = idx_frame.argmax(dim=1)  # [B, K]
+            sel_exp = sel[:, :, None, None].expand(B, K, O, D)
+            return torch.gather(obj_feat, dim=1, index=sel_exp)
+        # Soft-mix (legacy): obj_feat[b,f,o,d] @ idx_frame[b,f,k] -> [b,k,o,d]
+        return (obj_feat.flatten(-2, -1).transpose(1, 2) @ idx_frame).transpose(1, 2).view(B, K, O, D)
 
     def forward_with_knowledge(self, frame_feat, obj_feat, qns_word, ans_word, q_family_id, knowledge_feat=None):
         """Knowledge-aware forward that returns detailed scores for reranking/training."""
@@ -272,11 +337,10 @@ class VideoQAmodel(nn.Module):
 
         frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2) # B, Frame_K, d)
 
-        # obj
-        obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
+        # obj: hard-gather (preserves spatial correspondence) or legacy soft-mix
+        obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
         obj_feat = self._fit_obj_feat_dim(obj_feat)
-        obj_feat = self.obj_pre_norm(obj_feat)  # LayerNorm only when use_grounding_dino, else Identity
-        obj_local = self.obj_resize(obj_feat)
+        obj_local = self._encode_objects(obj_feat)
         
         # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
@@ -399,11 +463,10 @@ class VideoQAmodel(nn.Module):
         
         frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2)
         
-        # Object processing
-        obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B, self.frame_topK, O, -1)
+        # Object processing (hard-gather + bbox pos-embed when enabled)
+        obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
         obj_feat = self._fit_obj_feat_dim(obj_feat)
-        obj_feat = self.obj_pre_norm(obj_feat)
-        obj_local = self.obj_resize(obj_feat)
+        obj_local = self._encode_objects(obj_feat)
         
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0)
@@ -505,6 +568,43 @@ class VideoQAmodel(nn.Module):
 
         return encoded_text, tokenized_queries.attention_mask.bool()
     
+
+
+class BBoxPosEmbed2D(nn.Module):
+    """2D sinusoidal positional embedding for normalized bboxes [x1,y1,x2,y2] in [0,1].
+
+    Splits the bbox into 4 components (cx, cy, w, h), each encoded with d_model/4
+    sin/cos features, then concatenated into a d_model-vector. This recovers
+    spatial information that gets erased when bbox is concat'd with high-dim
+    semantic features and passed through a single LayerNorm.
+    """
+
+    def __init__(self, d_model, dropout=0.0, temperature=10000):
+        super().__init__()
+        if d_model % 8 != 0:
+            raise ValueError(f"d_model must be divisible by 8 for BBoxPosEmbed2D (4 components x even num_pos_feats); got {d_model}")
+        self.d_model = d_model
+        self.num_pos_feats = d_model // 4
+        self.temperature = float(temperature)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, bbox):
+        # bbox: [..., 4] in [0, 1] order [x1, y1, x2, y2]
+        x1, y1, x2, y2 = bbox.unbind(-1)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        w = (x2 - x1).clamp(min=1e-6)
+        h = (y2 - y1).clamp(min=1e-6)
+        coords = torch.stack([cx, cy, w, h], dim=-1) * (2.0 * math.pi)  # [..., 4]
+
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=bbox.device)
+        dim_t = self.temperature ** (2 * torch.div(dim_t, 2, rounding_mode='floor') / self.num_pos_feats)
+
+        pos = coords[..., None] / dim_t  # [..., 4, num_pos_feats]
+        pos = torch.stack((pos[..., 0::2].sin(), pos[..., 1::2].cos()), dim=-1).flatten(-2)
+        # pos: [..., 4, num_pos_feats]
+        pos = pos.flatten(-2)  # [..., d_model]
+        return self.dropout(pos)
 
 
 class FeatureResizer(nn.Module):
