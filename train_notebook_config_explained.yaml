@@ -1,0 +1,198 @@
+# Config snapshot extracted from Train_full_mode_kaggle.ipynb
+# Purpose: record notebook train setup + explain key parameters/techniques.
+
+meta:
+  source_notebook: "Train_full_mode_kaggle.ipynb"
+  run_profile_default: "run1"
+  run3_reg_mode_default: "dropout"
+  notes:
+    - "Notebook applies profile values from RUN_PROFILES, then optional run3 override."
+    - "This file describes effective defaults in the checked notebook."
+
+paths:
+  # DINOv3 frame-level .pt features (merged all splits)
+  video_feature_root: "/kaggle/working/dinov3_T16_dim1024_merge"
+  # GroundingDINO+FRCNN object .pkl features
+  grounding_dino_path: "/kaggle/input/gdinofrcnn-features"
+  # QA annotations
+  sample_list_path: "/kaggle/input/text-annotation/QA"
+  # train/valid/test split pkl folder
+  split_dir_txt: "/kaggle/input/casual-vid-data-split/split"
+  model_dir: "/kaggle/working/models"
+
+data:
+  n_query: 5                  # number of answer candidates per question
+  frames: 16                  # max frame slots per sample
+  topK_frame: 16              # DataLoader temporal sampling target length
+  select_frames: 5            # model internal selected frames after frame attention
+  objs: 12                    # number of object tokens per selected frame
+  topK_obj: 12                # used in non-GDINO path; GDINO path keeps all selected objs
+  num_workers: 4
+  return_family_id: true      # returns question family id for HUM/LUM routing
+  hard_eval: false
+  max_samples: null
+
+features:
+  frame_feat_dim: 1024        # DINOv3 frame feature width
+  obj_feat_dim: 2820          # 2048 ROI + 768 class text + 4 bbox
+  use_grounding_dino: true
+  obj_use_bbox_pos_embed: true
+  obj_bbox_dim: 4
+  obj_hard_gather_from_frame: true
+  feature_encoding_explanation:
+    - "Frame feature uses linear projection + LN + dropout to d_model."
+    - "Object feature can split semantic and bbox branches, then fuse."
+    - "Hard gather preserves frame-object correspondence for selected frames."
+
+model:
+  d_model: 768
+  word_dim: 768
+  nheads: 8
+  num_encoder_layers: 2
+  num_decoder_layers: 2
+  normalize_before: true
+  activation: "gelu"
+  dropout: 0.3
+  encoder_dropout: 0.3
+  architecture_explanation:
+    - "Hierarchical stack: frame_decoder -> obj_decoder -> fo_decoder -> vl_encoder -> ans_decoder."
+    - "answer_head scores each candidate; evidence_head adds verifier supervision."
+    - "knowledge_head is family-aware and can build fused_score."
+
+text_encoder:
+  text_encoder_type: "microsoft/deberta-base"
+  freeze_text_encoder: false
+  text_encoder_lr: 0.000005
+  text_pool_mode: 1
+  use_lora: false
+  lora_r: 8
+  lora_alpha: 16
+  lora_dropout: 0.1
+  lora_target_modules:
+    - "query_proj"
+    - "key_proj"
+    - "value_proj"
+  text_training_explanation:
+    - "Current notebook uses full fine-tune (not frozen, LoRA off)."
+    - "Text params are put in a dedicated optimizer group with lower LR."
+
+train:
+  seed: 999
+  gpu: 0
+  bs: 8
+  accumulation_steps: 4
+  effective_batch_size: 32
+  epoch: 10
+  lr: 0.00001
+  decay: 0.0001
+  gamma: 0.5
+  lr_patience: 1
+  min_lr: 0.0000001
+  early_stop_start_epoch: 5
+  early_stop_patience: 4
+  early_stop_min_delta: 0.05
+  gradient_clip_max_norm: 1.0
+  training_loop_explanation:
+    - "Gradient accumulation simulates bigger batch with lower memory."
+    - "Scheduler ReduceLROnPlateau monitors val_acc."
+    - "Early stop only starts counting after early_stop_start_epoch."
+
+losses:
+  lambda_verifier: 0.25
+  lambda_knowledge: 0.30
+  aux_warmup_epochs: 2
+  bce_for_aux_heads: true
+  ncod_u_lr: 0.1
+  hum_alpha: 1.0
+  u_init: 1e-8
+  u_clamp_min: 0.0
+  u_clamp_max: 0.99
+  ncod_explanation:
+    - "L1 updates model parameters with U detached in shifted probability."
+    - "L2 updates U with model probability detached."
+    - "HUM/LUM routing uses question family (hard families use HUM weighting)."
+
+run_profiles:
+  baseline:
+    epoch: 10
+    lr: 0.00001
+    lambda_verifier: 0.3
+    lambda_knowledge: 0.2
+    early_stop_start_epoch: 5
+    early_stop_patience: 4
+    dropout: 0.3
+    encoder_dropout: 0.3
+    decay: 0.0001
+  run1:
+    epoch: 10
+    lr: 0.00001
+    lambda_verifier: 0.25
+    lambda_knowledge: 0.3
+    early_stop_start_epoch: 5
+    early_stop_patience: 4
+    dropout: 0.3
+    encoder_dropout: 0.3
+    decay: 0.0001
+  run2:
+    epoch: 10
+    lr: 0.000008
+    lambda_verifier: 0.25
+    lambda_knowledge: 0.3
+    early_stop_start_epoch: 6
+    early_stop_patience: 5
+    dropout: 0.3
+    encoder_dropout: 0.3
+    decay: 0.0001
+  run3:
+    epoch: 10
+    lr: 0.000008
+    lambda_verifier: 0.25
+    lambda_knowledge: 0.3
+    early_stop_start_epoch: 6
+    early_stop_patience: 5
+    dropout: 0.3
+    encoder_dropout: 0.3
+    decay: 0.0001
+  run3_overrides:
+    dropout_mode:
+      dropout: 0.25
+      encoder_dropout: 0.25
+    decay_mode:
+      decay: 0.00008
+
+evaluation:
+  core_metrics:
+    - "Description"
+    - "Explanation"
+    - "Predictive-Answer"
+    - "Predictive-Reason"
+    - "Counterfactual-Answer"
+    - "Counterfactual-Reason"
+    - "PAR"
+    - "CAR"
+    - "Acc_ALL"
+  weighted_score_weak_priority_formula: "0.35*Predictive-Reason + 0.35*Counterfactual-Reason + 0.20*Acc_ALL + 0.10*best_val_acc"
+  memory_postcheck:
+    enabled: true
+    topk_knowledge: 5
+    memory_pass_threshold: 0.15
+    memory_gate_enabled: true
+    memory_margin: 0.05
+  evaluation_explanation:
+    - "PAR/CAR are strict pair metrics and are usually harder than plain per-type accuracy."
+    - "Weighted score favors weak causal reasoning families (reason branches)."
+
+gradcam_visualization:
+  code_paths:
+    - "explain/gradcam_hooks.py"
+    - "explain/viz_gradcam.py"
+  supported_views:
+    - "frame Grad-CAM"
+    - "object bbox alpha Grad-CAM"
+    - "question-token Grad-CAM"
+    - "memory visual vs question split"
+    - "attention vs Grad-CAM vs rollout"
+  caution:
+    - "Current hooked forward is not fully identical to model.forward object path."
+    - "Use visualization as diagnostic signal unless parity check is implemented."
+

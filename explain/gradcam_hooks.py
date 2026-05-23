@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 from einops import rearrange
+from networks.topk import HardtopK
 
 
 # ---------------------------------------------------------------------------
@@ -83,6 +84,29 @@ class MultiTargetGradCAM:
     def __init__(self, model):
         self.model = model
 
+    @staticmethod
+    def _select_topk_indices(sorter, att_map: torch.Tensor, n_items: int, hard_eval: bool, training: bool) -> torch.Tensor:
+        """Mirror model.forward top-k routing for both frame/object branches."""
+        if training:
+            return rearrange(
+                sorter(att_map.flatten(1, 2)),
+                "b (n q) k -> b n q k",
+                n=n_items,
+            ).sum(-2)
+
+        if hard_eval:
+            return rearrange(
+                HardtopK(att_map.flatten(1, 2), sorter.k),
+                "b (n q) k -> b n q k",
+                n=n_items,
+            ).sum(-2)
+
+        return rearrange(
+            sorter(att_map.flatten(1, 2)),
+            "b (n q) k -> b n q k",
+            n=n_items,
+        ).sum(-2)
+
     # ------------------------------------------------------------------
     # Custom hookable forward (mirrors model.forward but keeps grads)
     # ------------------------------------------------------------------
@@ -118,21 +142,24 @@ class MultiTargetGradCAM:
         )
         frame_local.retain_grad()
 
-        # frame top-K selection (use eval-time perturbed sorter; differentiable enough)
-        idx_frame = rearrange(
-            model.frame_sorter(frame_att.flatten(1, 2)),
-            "b (f q) k -> b f q k",
-            f=F_total,
-        ).sum(-2)
+        # frame top-K selection (same logic as model.forward train/eval/hard_eval branch)
+        idx_frame = self._select_topk_indices(
+            sorter=model.frame_sorter,
+            att_map=frame_att,
+            n_items=F_total,
+            hard_eval=model.hard_eval,
+            training=model.training,
+        )
         frame_local_top = (frame_local.transpose(1, 2) @ idx_frame).transpose(1, 2)
 
         # ---- object decoder ----
-        obj_feat_top = (
-            obj_feat.flatten(-2, -1).transpose(1, 2) @ idx_frame
-        ).transpose(1, 2).view(B, model.frame_topK, O, -1)
+        # Keep object path parity with model.forward:
+        # 1) select objects by selected frames (hard gather if configured)
+        # 2) fit object width
+        # 3) encode via semantic+bbox path when enabled
+        obj_feat_top = model._select_obj_by_frame(obj_feat, idx_frame)
         obj_feat_top = model._fit_obj_feat_dim(obj_feat_top)
-        obj_feat_top = model.obj_pre_norm(obj_feat_top)
-        obj_local_in = model.obj_resize(obj_feat_top)
+        obj_local_in = model._encode_objects(obj_feat_top)
 
         q_local_rep = q_local.repeat_interleave(model.frame_topK, dim=0)
         q_mask_rep = q_mask.repeat_interleave(model.frame_topK, dim=0)
@@ -147,11 +174,13 @@ class MultiTargetGradCAM:
         if model.use_grounding_dino:
             obj_local_view = obj_local.view(B, model.frame_topK, O, -1)
         else:
-            idx_obj = rearrange(
-                model.obj_sorter(obj_att.flatten(1, 2)),
-                "b (o q) k -> b o q k",
-                o=O,
-            ).sum(-2)
+            idx_obj = self._select_topk_indices(
+                sorter=model.obj_sorter,
+                att_map=obj_att,
+                n_items=O,
+                hard_eval=model.hard_eval,
+                training=model.training,
+            )
             obj_local_view = (
                 obj_local.transpose(1, 2) @ idx_obj
             ).transpose(1, 2).view(B, model.frame_topK, model.obj_topK, -1)
@@ -162,8 +191,8 @@ class MultiTargetGradCAM:
             obj_local_view.flatten(1, 2),
             output_attentions=True,
         )
-        frame_obj.retain_grad()
         frame_obj = frame_obj.view(B, model.frame_topK, -1)
+        frame_obj.retain_grad()
 
         # ---- unified memory ----
         frame_mask_top = torch.ones(B, model.frame_topK, dtype=torch.bool, device=device)
