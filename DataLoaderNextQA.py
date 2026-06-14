@@ -32,8 +32,11 @@ NEXTQA_TYPE_TO_FAMILY: Dict[str, int] = {
     'CW': 2, 'CH': 2,
 }
 
-# 1024 (ROI DINOv3-L) + 768 (cls text DeBERTa) + 4 (bbox normalized)
-GDINO_DIM = 1796
+# 2048 (FasterRCNN ROI) + 768 (cls text DeBERTa) + 4 (bbox normalized)
+GDINO_ROI_DIM = 2048
+GDINO_TEXT_DIM = 768
+GDINO_BBOX_DIM = 4
+GDINO_DIM = GDINO_ROI_DIM + GDINO_TEXT_DIM + GDINO_BBOX_DIM
 
 
 def scan_video_pt(root: str) -> Dict[str, str]:
@@ -79,7 +82,7 @@ class NextQADataset(Dataset):
 
     Với:
         ff:        [topK_frame, frame_feat_dim]   (DINOv3 .pt)
-        of:        [topK_frame, obj_num, 1796]    (GDINO concat)
+        of:        [topK_frame, obj_num, 2820]    (GDINO concat)
         qns:       str (question)
         ans_word:  list[str] gồm n_query câu "{q} [SEP] {ai}"
         ans_id:    int (chỉ số đáp án đúng 0..n_query-1)
@@ -169,18 +172,23 @@ class NextQADataset(Dataset):
             objs = []
             for idx in indices:
                 fd = frames_data[idx]
-                roi = np.asarray(fd.get('roi_features', np.zeros((0, 1024), np.float32)), np.float32)
-                cls = np.asarray(fd.get('class_text_embedding', np.zeros((0, 768), np.float32)), np.float32)
-                box = np.asarray(fd.get('boxes_xyxy_orig', np.zeros((0, 4), np.float32)), np.float32)
+                roi = np.asarray(fd.get('roi_features', np.zeros((0, GDINO_ROI_DIM), np.float32)), np.float32)
+                cls = np.asarray(fd.get('class_text_embedding', np.zeros((0, GDINO_TEXT_DIM), np.float32)), np.float32)
+                box = np.asarray(fd.get('boxes_xyxy_orig', np.zeros((0, GDINO_BBOX_DIM), np.float32)), np.float32)
                 n_det = len(roi)
                 if len(cls) != n_det:
-                    cls = np.zeros((n_det, 768), np.float32)
+                    cls = np.zeros((n_det, GDINO_TEXT_DIM), np.float32)
                 if len(box) > 0:
                     box = box / np.array([orig_w, orig_h, orig_w, orig_h], np.float32)
                 else:
-                    box = np.zeros((n_det, 4), np.float32) if n_det > 0 else np.zeros((0, 4), np.float32)
+                    box = np.zeros((n_det, GDINO_BBOX_DIM), np.float32) if n_det > 0 else np.zeros((0, GDINO_BBOX_DIM), np.float32)
 
                 if n_det > 0:
+                    if roi.shape[-1] != GDINO_ROI_DIM:
+                        fixed = np.zeros((n_det, GDINO_ROI_DIM), np.float32)
+                        width = min(roi.shape[-1], GDINO_ROI_DIM)
+                        fixed[:, :width] = roi[:, :width]
+                        roi = fixed
                     roi = np.nan_to_num(roi)
                     cls = np.nan_to_num(cls)
                     box = np.nan_to_num(np.clip(box, 0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0)

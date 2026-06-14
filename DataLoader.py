@@ -18,6 +18,11 @@ FAMILY_TO_ID = {
     'counterfactual_reason': 5,
 }
 
+GDINO_ROI_DIM = 2048
+GDINO_TEXT_DIM = 768
+GDINO_BBOX_DIM = 4
+GDINO_DIM = GDINO_ROI_DIM + GDINO_TEXT_DIM + GDINO_BBOX_DIM
+
 
 class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
@@ -302,9 +307,8 @@ class VideoQADataset(Dataset):
         Load GroundingDINO ROI features from pickle.
         
         Returns:
-            torch.Tensor: [topK_frame, obj_num, 1796] where 1796 = 1024 (ROI) + 768 (class_text_embedding) + 4 (bbox normalized)
+            torch.Tensor: [topK_frame, obj_num, 2820] where 2820 = 2048 (ROI) + 768 (class_text_embedding) + 4 (bbox normalized)
         """
-        GDINO_DIM = 1796  # roi(1024) + cls_text_emb(768) + bbox(4)
         pkl_path = self.gdino_feature_map.get(vid)
         if not pkl_path or not osp.exists(pkl_path):
             return torch.zeros(self.topK_frame, self.obj_num, GDINO_DIM)
@@ -331,35 +335,40 @@ class VideoQADataset(Dataset):
             objs = []
             for idx in indices:
                 frame_dict = frames_data[idx]
-                roi_feats = np.asarray(frame_dict.get('roi_features', np.zeros((0, 1024), dtype=np.float32)), dtype=np.float32)  # [N, 1024]
-                cls_emb = np.asarray(frame_dict.get('class_text_embedding', np.zeros((0, 768), dtype=np.float32)), dtype=np.float32)  # [N, 768]
-                boxes_orig = np.asarray(frame_dict.get('boxes_xyxy_orig', np.zeros((0, 4), dtype=np.float32)), dtype=np.float32)  # [N, 4]
+                roi_feats = np.asarray(frame_dict.get('roi_features', np.zeros((0, GDINO_ROI_DIM), dtype=np.float32)), dtype=np.float32)  # [N, 2048]
+                cls_emb = np.asarray(frame_dict.get('class_text_embedding', np.zeros((0, GDINO_TEXT_DIM), dtype=np.float32)), dtype=np.float32)  # [N, 768]
+                boxes_orig = np.asarray(frame_dict.get('boxes_xyxy_orig', np.zeros((0, GDINO_BBOX_DIM), dtype=np.float32)), dtype=np.float32)  # [N, 4]
                 
                 n_det = len(roi_feats)
                 
                 # Align cls_emb length with roi_feats
                 if len(cls_emb) != n_det:
                     if n_det > 0:
-                        cls_emb = np.zeros((n_det, 768), dtype=np.float32)
+                        cls_emb = np.zeros((n_det, GDINO_TEXT_DIM), dtype=np.float32)
                     else:
-                        cls_emb = np.zeros((0, 768), dtype=np.float32)
+                        cls_emb = np.zeros((0, GDINO_TEXT_DIM), dtype=np.float32)
                 
                 # Normalize bbox to [0, 1]
                 if len(boxes_orig) > 0:
                     boxes_norm = boxes_orig / np.array([orig_w, orig_h, orig_w, orig_h], dtype=np.float32)
                 else:
-                    boxes_norm = np.zeros((n_det, 4), dtype=np.float32) if n_det > 0 else np.zeros((0, 4), dtype=np.float32)
+                    boxes_norm = np.zeros((n_det, GDINO_BBOX_DIM), dtype=np.float32) if n_det > 0 else np.zeros((0, GDINO_BBOX_DIM), dtype=np.float32)
                 
                 # Sanitize NaN/Inf and L2-normalize each feature block to keep scales comparable
                 # (mixed-scale features cause gradient explosion through obj_resize Linear layer).
                 if n_det > 0:
+                    if roi_feats.shape[-1] != GDINO_ROI_DIM:
+                        fixed = np.zeros((n_det, GDINO_ROI_DIM), dtype=np.float32)
+                        width = min(roi_feats.shape[-1], GDINO_ROI_DIM)
+                        fixed[:, :width] = roi_feats[:, :width]
+                        roi_feats = fixed
                     roi_feats = np.nan_to_num(roi_feats, nan=0.0, posinf=0.0, neginf=0.0)
                     cls_emb = np.nan_to_num(cls_emb, nan=0.0, posinf=0.0, neginf=0.0)
                     boxes_norm = np.nan_to_num(np.clip(boxes_norm, 0.0, 1.0), nan=0.0, posinf=1.0, neginf=0.0)
                     roi_feats = _l2_norm(roi_feats)
                     cls_emb = _l2_norm(cls_emb)
                 
-                # Concat: [N, 1024] + [N, 768] + [N, 4] = [N, 1796]
+                # Concat: [N, 2048] + [N, 768] + [N, 4] = [N, 2820]
                 if n_det > 0:
                     obj_feat = np.concatenate([roi_feats, cls_emb, boxes_norm], axis=-1)
                 else:
@@ -381,7 +390,7 @@ class VideoQADataset(Dataset):
             while len(objs) < self.topK_frame:
                 objs.append(torch.zeros(self.obj_num, GDINO_DIM))
             
-            return torch.stack(objs)  # [topK_frame, obj_num, 1796]
+            return torch.stack(objs)  # [topK_frame, obj_num, 2820]
         
         except Exception as e:
             # Fallback to zeros on error

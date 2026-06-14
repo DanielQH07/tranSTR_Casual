@@ -28,6 +28,29 @@ except ImportError:
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
 
+
+class BBoxPositionalEmbedding2D(nn.Module):
+    """Project normalized [x1, y1, x2, y2] boxes into d_model positional features."""
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Linear(4, d_model),
+            nn.LayerNorm(d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, boxes):
+        boxes = boxes.clamp(0.0, 1.0)
+        x1, y1, x2, y2 = boxes.unbind(dim=-1)
+        cx = (x1 + x2) * 0.5
+        cy = (y1 + y2) * 0.5
+        bw = (x2 - x1).clamp(min=1e-6)
+        bh = (y2 - y1).clamp(min=1e-6)
+        return self.proj(torch.stack([cx, cy, bw, bh], dim=-1))
+
+
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
@@ -41,6 +64,17 @@ class VideoQAmodel(nn.Module):
         self.hard_eval = hard_eval
         self.use_grounding_dino = use_grounding_dino
         self.objs = objs
+        self.obj_feat_dim = obj_feat_dim
+        self.obj_bbox_dim = int(kwargs.get('obj_bbox_dim', 4))
+        self.obj_use_bbox_pos_embed = bool(kwargs.get('obj_use_bbox_pos_embed', False))
+        self.obj_hard_gather_from_frame = bool(kwargs.get('obj_hard_gather_from_frame', False))
+        self.obj_sem_dim = obj_feat_dim
+        if self.obj_use_bbox_pos_embed:
+            if obj_feat_dim <= self.obj_bbox_dim:
+                raise ValueError(
+                    f"obj_feat_dim={obj_feat_dim} must be larger than obj_bbox_dim={self.obj_bbox_dim}"
+                )
+            self.obj_sem_dim = obj_feat_dim - self.obj_bbox_dim
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -79,9 +113,13 @@ class VideoQAmodel(nn.Module):
             dropout=kwargs['dropout'])
 
         self.obj_resize = FeatureResizer(
-            input_feat_size=obj_feat_dim,
+            input_feat_size=self.obj_sem_dim,
             output_feat_size=self.d_model, 
             dropout=kwargs['dropout'])
+        if self.obj_use_bbox_pos_embed:
+            self.obj_sem_norm = nn.LayerNorm(self.obj_sem_dim, eps=1e-12)
+            self.obj_bbox_pos_embed = BBoxPositionalEmbedding2D(self.d_model)
+            self.obj_out_norm = nn.LayerNorm(self.d_model, eps=1e-12)
 
         self.frame_topK, self.obj_topK = topK_frame, topK_obj
         
@@ -139,6 +177,28 @@ class VideoQAmodel(nn.Module):
         answer_score = self.answer_head(cand_feat).squeeze(-1)
         evidence_score = self.evidence_head(cand_feat).squeeze(-1)
         return cand_feat, answer_score, evidence_score
+
+    def encode_object_features(self, obj_feat):
+        if not self.obj_use_bbox_pos_embed:
+            return self.obj_resize(obj_feat)
+
+        sem_feat = obj_feat[..., :-self.obj_bbox_dim]
+        bbox = obj_feat[..., -self.obj_bbox_dim:]
+        sem_feat = self.obj_sem_norm(sem_feat)
+        sem_local = self.obj_resize(sem_feat)
+        bbox_local = self.obj_bbox_pos_embed(bbox)
+        return self.obj_out_norm(sem_local + bbox_local)
+
+    def gather_objects_from_selected_frames(self, obj_feat, idx_frame):
+        if not (self.use_grounding_dino and self.obj_hard_gather_from_frame):
+            return (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(
+                obj_feat.size(0), self.frame_topK, obj_feat.size(2), -1
+            )
+
+        B, F, O, D = obj_feat.shape
+        frame_idx = idx_frame.detach().argmax(dim=1)  # [B, frame_topK]
+        gather_idx = frame_idx.view(B, self.frame_topK, 1, 1).expand(-1, -1, O, D)
+        return obj_feat.gather(dim=1, index=gather_idx)
 
     def pool_memory(self, mem, mem_mask=None):
         # Mean-pool by default to keep behavior stable and lightweight.
@@ -221,7 +281,7 @@ class VideoQAmodel(nn.Module):
     def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
-        :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
+        :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 12, 2820]
         :param qns: ('what are three people sitting on?', 'what is a family having?')
         :return:
         """
@@ -257,8 +317,8 @@ class VideoQAmodel(nn.Module):
         frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2) # B, Frame_K, d)
 
         # obj
-        obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B,self.frame_topK,O,-1)
-        obj_local = self.obj_resize(obj_feat)
+        obj_feat = self.gather_objects_from_selected_frames(obj_feat, idx_frame)
+        obj_local = self.encode_object_features(obj_feat)
         
         # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
@@ -382,8 +442,8 @@ class VideoQAmodel(nn.Module):
         frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2)
         
         # Object processing
-        obj_feat = (obj_feat.flatten(-2,-1).transpose(1,2) @ idx_frame).transpose(1,2).view(B, self.frame_topK, O, -1)
-        obj_local = self.obj_resize(obj_feat)
+        obj_feat = self.gather_objects_from_selected_frames(obj_feat, idx_frame)
+        obj_local = self.encode_object_features(obj_feat)
         
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0)
@@ -395,16 +455,18 @@ class VideoQAmodel(nn.Module):
             output_attentions=True
         )
         
-        # TopK object selection
-        if self.training:
-            idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+        if self.use_grounding_dino:
+            obj_local = obj_local.view(B, self.frame_topK, O, -1)
         else:
-            if self.hard_eval:
-                idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
-            else:
+            # TopK object selection
+            if self.training:
                 idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
-        
-        obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+            else:
+                if self.hard_eval:
+                    idx_obj = rearrange(HardtopK(obj_att.flatten(1,2), self.obj_topK), 'b (o q) k -> b o q k', o=O).sum(-2)
+                else:
+                    idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
+            obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
         
         # Hierarchy grouping
         frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
