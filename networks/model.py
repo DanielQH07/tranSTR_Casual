@@ -382,7 +382,8 @@ class VideoQAmodel(nn.Module):
                 "mem": mem,
                 "mem_pool": mem_pool,
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                "idx_frame": idx_frame
             }
 
         if q_family_id is not None:
@@ -501,7 +502,8 @@ class VideoQAmodel(nn.Module):
                 "mem": mem,
                 "mem_pool": mem_pool,
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                "idx_frame": idx_frame
             }
 
         if q_family_id is not None:
