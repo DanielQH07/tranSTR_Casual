@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 import torch
 import os
 import re
@@ -28,7 +29,7 @@ class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 
                  topK_frame=16, max_samples=None, verbose=True, 
-                 text_feature_path=None, grounding_dino_path=None, return_family_id=False):
+                 text_feature_path=None, grounding_dino_path=None, return_family_id=False, caption_path=None):
         """
         DataLoader with support for pre-extracted text features and GroundingDINO ROI features.
         
@@ -61,6 +62,14 @@ class VideoQADataset(Dataset):
                 self.use_cached = True
                 if self.verbose:
                     print(f"[{split}] Loaded {len(self.text_features)} cached text features")
+
+        # Load question-aware captions
+        self.captions = {}
+        if caption_path and osp.exists(caption_path):
+            with open(caption_path, 'r', encoding='utf-8') as f:
+                self.captions = json.load(f)
+            if self.verbose:
+                print(f"[{split}] Loaded {len(self.captions)} question-aware captions")
 
         # Detect object format
         self.obj_format = self._detect_obj_format()
@@ -284,6 +293,9 @@ class VideoQADataset(Dataset):
             of = self._load_object_features(vid)
         of = torch.nan_to_num(of.float(), nan=0.0, posinf=0.0, neginf=0.0)
         
+        # Load caption (fallback to empty string if not available)
+        caption_text = self.captions.get(qns_key, "")
+        
         # Text features - cached or raw
         if self.use_cached and qns_key in self.text_features:
             tf = self.text_features[qns_key]
@@ -293,14 +305,14 @@ class VideoQADataset(Dataset):
             qa_mask = torch.from_numpy(tf['qa_mask']).bool()        # [5, qa_len]
 
             if self.return_family_id:
-                return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key, q_family_id
-            return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key
+                return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key, q_family_id, caption_text
+            return ff, of, q_encoded, q_mask, qa_encoded, qa_mask, ans_id, qns_key, caption_text
         else:
             # Raw text strings for real-time encoding
             ans_word = [f"{qns} [SEP] {c[f'a{i}']}" for i in range(self.mc)]
             if self.return_family_id:
-                return ff, of, qns, ans_word, ans_id, qns_key, q_family_id
-            return ff, of, qns, ans_word, ans_id, qns_key
+                return ff, of, qns, ans_word, ans_id, qns_key, q_family_id, caption_text
+            return ff, of, qns, ans_word, ans_id, qns_key, caption_text
 
     def _load_gdino_object_features(self, vid):
         """

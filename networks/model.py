@@ -133,6 +133,10 @@ class VideoQAmodel(nn.Module):
         self.vl_encoder = TransformerEncoder(TransformerEncoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
         self.ans_decoder = TransformerDecoder(TransformerDecoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
 
+        # --- CAPTION BRANCH ---
+        self.caption_proj = nn.Linear(768, self.d_model)
+        self.caption_gate = nn.Parameter(torch.zeros(1))  # Gated fusion to stabilize training
+
         # position embedding
         self.pos_encoder_1d = PositionEmbeddingSine1D()
 
@@ -299,11 +303,12 @@ class VideoQAmodel(nn.Module):
             aux["fused_score"] = aux["answer_score"]
         return aux
 
-    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None):
+    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None, caption_text=None):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
         :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
         :param qns: ('what are three people sitting on?', 'what is a family having?')
+        :param caption_text: tuple/list of strings, length bs
         :return:
         """
         # Size
@@ -377,9 +382,24 @@ class VideoQAmodel(nn.Module):
         
         ### overall fusion
         frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
-        frame_obj =frame_obj.view(B, self.frame_topK, -1)
-        frame_qns_mask = torch.cat((frame_mask, q_mask),dim=1).bool()
-        mem = self.vl_encoder(torch.cat((frame_obj, q_local), dim=1), \
+        frame_obj = frame_obj.view(B, self.frame_topK, -1)
+        
+        # Base memory inputs: frames and questions
+        mem_inputs = [frame_obj, q_local]
+        mem_masks = [frame_mask, q_mask]
+        
+        # Optional caption branch
+        if caption_text is not None and len(caption_text) > 0 and caption_text[0] != "":
+            cap_feat, cap_mask = self.forward_text(list(caption_text), device)
+            # Apply gated fusion to caption features to prevent breaking pre-trained representations
+            cap_feat = cap_feat + self.caption_gate * self.caption_proj(cap_feat)
+            mem_inputs.append(cap_feat)
+            mem_masks.append(cap_mask)
+        
+        mem_input = torch.cat(mem_inputs, dim=1)
+        frame_qns_mask = torch.cat(mem_masks, dim=1).bool()
+        
+        mem = self.vl_encoder(mem_input, \
                             src_key_padding_mask=frame_qns_mask, \
                             pos = self.pos_encoder_1d(frame_qns_mask.bool(), self.d_model)
                             ) # b,16,d
