@@ -440,7 +440,7 @@ class VideoQAmodel(nn.Module):
             return aux
         return logits
     
-    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False, q_family_id=None, knowledge_feat=None):
+    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False, q_family_id=None, knowledge_feat=None, caption_text=None):
         """
         Forward pass using pre-extracted text features (bypasses DeBERTa).
         
@@ -518,10 +518,24 @@ class VideoQAmodel(nn.Module):
         # Overall fusion
         frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
         frame_obj = frame_obj.view(B, self.frame_topK, -1)
-        frame_qns_mask = torch.cat((frame_mask, q_mask), dim=1).bool()
+        
+        # Base memory inputs: frames and questions
+        mem_inputs = [frame_obj, q_local]
+        mem_masks = [frame_mask, q_mask]
+        
+        # Optional caption branch
+        if caption_text is not None and len(caption_text) > 0 and caption_text[0] != "":
+            cap_feat, cap_mask = self.forward_text(list(caption_text), device)
+            # Apply gated fusion to caption features to prevent breaking pre-trained representations
+            cap_feat = cap_feat + self.caption_gate * self.caption_proj(cap_feat)
+            mem_inputs.append(cap_feat)
+            mem_masks.append(cap_mask)
+        
+        mem_input = torch.cat(mem_inputs, dim=1)
+        frame_qns_mask = torch.cat(mem_masks, dim=1).bool()
         
         mem = self.vl_encoder(
-            torch.cat((frame_obj, q_local), dim=1),
+            mem_input,
             src_key_padding_mask=frame_qns_mask,
             pos=self.pos_encoder_1d(frame_qns_mask.bool(), self.d_model)
         )
