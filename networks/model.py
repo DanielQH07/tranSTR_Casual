@@ -391,10 +391,20 @@ class VideoQAmodel(nn.Module):
         # Optional caption branch
         if caption_text is not None and len(caption_text) > 0 and caption_text[0] != "":
             cap_feat, cap_mask = self.forward_text(list(caption_text), device)
-            # Apply gated fusion to caption features to prevent breaking pre-trained representations
-            cap_feat = cap_feat + self.caption_gate * self.caption_proj(cap_feat)
-            mem_inputs.append(cap_feat)
-            mem_masks.append(cap_mask)
+            
+            # LOGIC FIX:
+            # 1. Extract [CLS] token (index 0) which contains the summarized sequence semantics
+            #    This is far better than mean() for preserving temporal/causal relationships.
+            cap_feat_cls = cap_feat[:, 0:1, :]  # [B, 1, d_model]
+            cap_mask_cls = torch.ones(B, 1, device=device).bool()
+            
+            # 2. Bypass caption_proj! caption_proj was randomly initialized and destroys 
+            #    the carefully aligned vector space from text_proj.
+            # 3. Apply gated fusion safely
+            cap_feat_fused = self.caption_gate * cap_feat_cls
+            
+            mem_inputs.append(cap_feat_fused)
+            mem_masks.append(cap_mask_cls)
         
         mem_input = torch.cat(mem_inputs, dim=1)
         frame_qns_mask = torch.cat(mem_masks, dim=1).bool()
@@ -526,10 +536,20 @@ class VideoQAmodel(nn.Module):
         # Optional caption branch
         if caption_text is not None and len(caption_text) > 0 and caption_text[0] != "":
             cap_feat, cap_mask = self.forward_text(list(caption_text), device)
-            # Apply gated fusion to caption features to prevent breaking pre-trained representations
-            cap_feat = cap_feat + self.caption_gate * self.caption_proj(cap_feat)
-            mem_inputs.append(cap_feat)
-            mem_masks.append(cap_mask)
+            
+            # LOGIC FIX:
+            # 1. Extract [CLS] token (index 0) which contains the summarized sequence semantics
+            #    This is far better than mean() for preserving temporal/causal relationships.
+            cap_feat_cls = cap_feat[:, 0:1, :]  # [B, 1, d_model]
+            cap_mask_cls = torch.ones(B, 1, device=device).bool()
+            
+            # 2. Bypass caption_proj! caption_proj was randomly initialized and destroys 
+            #    the carefully aligned vector space from text_proj.
+            # 3. Apply gated fusion safely
+            cap_feat_fused = self.caption_gate * cap_feat_cls
+            
+            mem_inputs.append(cap_feat_fused)
+            mem_masks.append(cap_mask_cls)
         
         mem_input = torch.cat(mem_inputs, dim=1)
         frame_qns_mask = torch.cat(mem_masks, dim=1).bool()
