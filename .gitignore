@@ -18,3 +18,4 @@ __pycache__
 prediction/*
 log/*
 data/*
+qwen/*
