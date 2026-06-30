@@ -134,8 +134,10 @@ class VideoQAmodel(nn.Module):
         self.ans_decoder = TransformerDecoder(TransformerDecoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
 
         # --- CAPTION BRANCH ---
-        self.caption_proj = nn.Linear(768, self.d_model)
-        self.caption_gate = nn.Parameter(torch.zeros(1))  # Gated fusion to stabilize training
+        # caption_proj is NOT used: cap_feat from forward_text() is already projected via text_proj.
+        # caption_gate: learnable scalar initialized to 0.1 (NOT 0) so gradients can flow from epoch 1.
+        # If initialized to 0, gate * feat = 0 and grad(gate) ~ feat ~ 0 => gate never learns to open.
+        self.caption_gate = nn.Parameter(torch.tensor(0.1))
 
         # position embedding
         self.pos_encoder_1d = PositionEmbeddingSine1D()
@@ -392,16 +394,13 @@ class VideoQAmodel(nn.Module):
         if caption_text is not None and len(caption_text) > 0 and caption_text[0] != "":
             cap_feat, cap_mask = self.forward_text(list(caption_text), device)
             
-            # LOGIC FIX:
-            # 1. Extract [CLS] token (index 0) which contains the summarized sequence semantics
-            #    This is far better than mean() for preserving temporal/causal relationships.
+            # [CLS] token summarizes the entire caption sequence (designed for this by BERT/DeBERTa)
             cap_feat_cls = cap_feat[:, 0:1, :]  # [B, 1, d_model]
             cap_mask_cls = torch.ones(B, 1, device=device).bool()
             
-            # 2. Bypass caption_proj! caption_proj was randomly initialized and destroys 
-            #    the carefully aligned vector space from text_proj.
-            # 3. Apply gated fusion safely
-            cap_feat_fused = self.caption_gate * cap_feat_cls
+            # Gated fusion: sigmoid() clamps gate to (0,1) so it can't grow unbounded.
+            # gate initialized at 0.1 so gradients flow immediately from epoch 1.
+            cap_feat_fused = torch.sigmoid(self.caption_gate) * cap_feat_cls
             
             mem_inputs.append(cap_feat_fused)
             mem_masks.append(cap_mask_cls)
@@ -537,16 +536,13 @@ class VideoQAmodel(nn.Module):
         if caption_text is not None and len(caption_text) > 0 and caption_text[0] != "":
             cap_feat, cap_mask = self.forward_text(list(caption_text), device)
             
-            # LOGIC FIX:
-            # 1. Extract [CLS] token (index 0) which contains the summarized sequence semantics
-            #    This is far better than mean() for preserving temporal/causal relationships.
+            # [CLS] token summarizes the entire caption sequence (designed for this by BERT/DeBERTa)
             cap_feat_cls = cap_feat[:, 0:1, :]  # [B, 1, d_model]
             cap_mask_cls = torch.ones(B, 1, device=device).bool()
             
-            # 2. Bypass caption_proj! caption_proj was randomly initialized and destroys 
-            #    the carefully aligned vector space from text_proj.
-            # 3. Apply gated fusion safely
-            cap_feat_fused = self.caption_gate * cap_feat_cls
+            # Gated fusion: sigmoid() clamps gate to (0,1) so it can't grow unbounded.
+            # gate initialized at 0.1 so gradients flow immediately from epoch 1.
+            cap_feat_fused = torch.sigmoid(self.caption_gate) * cap_feat_cls
             
             mem_inputs.append(cap_feat_fused)
             mem_masks.append(cap_mask_cls)
