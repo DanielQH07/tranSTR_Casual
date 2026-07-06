@@ -28,6 +28,127 @@ except ImportError:
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
 
+class ContinuousTimeEncoding(nn.Module):
+    """Parameter-free sinusoidal encoding for normalized timestamps in [0, 1]."""
+
+    def __init__(self, d_model, temperature=10000.0):
+        super().__init__()
+        if d_model % 2 != 0:
+            raise ValueError(f"d_model must be even; got {d_model}")
+        self.d_model = int(d_model)
+        self.temperature = float(temperature)
+
+    def forward(self, timestamps):
+        timestamps = timestamps.clamp(0.0, 1.0) * (2.0 * math.pi)
+        dim_t = torch.arange(
+            self.d_model, dtype=torch.float32, device=timestamps.device
+        )
+        dim_t = self.temperature ** (
+            2 * torch.div(dim_t, 2, rounding_mode="floor") / self.d_model
+        )
+        phase = timestamps.float().unsqueeze(-1) / dim_t
+        encoding = torch.zeros_like(phase)
+        encoding[..., 0::2] = phase[..., 0::2].sin()
+        encoding[..., 1::2] = phase[..., 1::2].cos()
+        return encoding.to(dtype=timestamps.dtype)
+
+
+class SparseTemporalRelation(nn.Module):
+    """Reason over K selected event tokens and expose selector diagnostics."""
+
+    def __init__(
+        self,
+        d_model,
+        nheads=8,
+        dim_feedforward=1024,
+        dropout=0.2,
+        num_layers=1,
+        activation="gelu",
+        enabled=True,
+    ):
+        super().__init__()
+        self.enabled = bool(enabled)
+        self.time_encoder = ContinuousTimeEncoding(d_model)
+        layer = TransformerEncoderLayer(
+            d_model=d_model,
+            nheads=nheads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+        )
+        self.encoder = TransformerEncoder(
+            layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(d_model),
+        )
+
+    @staticmethod
+    def selector_diagnostics(idx_frame):
+        # idx_frame: [B, F, K]. Normalize each slot over the original frames.
+        selection_prob = idx_frame / idx_frame.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1e-6)
+        bsz, num_frames, topk = selection_prob.shape
+
+        time_axis = torch.linspace(
+            0.0, 1.0, num_frames,
+            device=selection_prob.device,
+            dtype=selection_prob.dtype,
+        )
+        selected_time = torch.einsum(
+            "bfk,f->bk", selection_prob, time_axis
+        ).clamp(0.0, 1.0)
+
+        slot_prob = F.normalize(
+            selection_prob.transpose(1, 2), p=2, dim=-1, eps=1e-6
+        )
+        gram = torch.bmm(slot_prob, slot_prob.transpose(1, 2))
+        if topk > 1:
+            eye = torch.eye(
+                topk, device=gram.device, dtype=torch.bool
+            ).unsqueeze(0)
+            overlap = gram.masked_select(~eye).view(
+                bsz, topk * (topk - 1)
+            ).mean(dim=1)
+        else:
+            overlap = gram.new_zeros(bsz)
+
+        hard_indices = selection_prob.argmax(dim=1)
+        unique_ratio = selection_prob.new_tensor([
+            torch.unique(row).numel() / float(topk)
+            for row in hard_indices
+        ])
+        time_span = selected_time.max(dim=1).values - selected_time.min(dim=1).values
+
+        return {
+            "frame_selection_prob": selection_prob,
+            "selected_time": selected_time,
+            "selection_unique_ratio": unique_ratio,
+            "selection_overlap": overlap,
+            "selected_time_span": time_span,
+        }
+
+    def forward(self, event_tokens, idx_frame):
+        diagnostics = self.selector_diagnostics(idx_frame)
+        if not self.enabled:
+            return event_tokens, diagnostics
+
+        time_pos = self.time_encoder(diagnostics["selected_time"]).to(
+            dtype=event_tokens.dtype
+        )
+        event_mask = torch.ones(
+            event_tokens.shape[:2],
+            dtype=torch.bool,
+            device=event_tokens.device,
+        )
+        event_tokens = self.encoder(
+            event_tokens,
+            src_key_padding_mask=event_mask,
+            pos=time_pos,
+        )
+        return event_tokens, diagnostics
+
+
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
@@ -116,6 +237,17 @@ class VideoQAmodel(nn.Module):
                 dropout=kwargs['dropout'])
 
         self.frame_topK, self.obj_topK = topK_frame, topK_obj
+
+        # Sparse temporal reasoning is applied only to the selected K event tokens.
+        self.temporal_relation = SparseTemporalRelation(
+            d_model=self.d_model,
+            nheads=kwargs.get("temporal_relation_nheads", kwargs.get("nheads", 8)),
+            dim_feedforward=kwargs.get("temporal_relation_ffn", 1024),
+            dropout=kwargs.get("temporal_relation_dropout", 0.2),
+            num_layers=kwargs.get("temporal_relation_layers", 1),
+            activation=kwargs.get("activation", "gelu"),
+            enabled=kwargs.get("use_temporal_relation", True),
+        )
         
         # Add text projection layer (BERT 768 -> d_model)
         self.text_proj = nn.Linear(768, self.d_model)
@@ -375,9 +507,12 @@ class VideoQAmodel(nn.Module):
                                     # memory_key_padding_mask=self.win_mask.unsqueeze(0).repeat(B,1,1).to(device)
                                     ) # b,16,d
         
+        ### sparse temporal relation reasoning over the selected events
+        frame_obj = frame_obj.view(B, self.frame_topK, -1)
+        frame_obj, selector_aux = self.temporal_relation(frame_obj, idx_frame)
+
         ### overall fusion
         frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
-        frame_obj =frame_obj.view(B, self.frame_topK, -1)
         frame_qns_mask = torch.cat((frame_mask, q_mask),dim=1).bool()
         mem = self.vl_encoder(torch.cat((frame_obj, q_local), dim=1), \
                             src_key_padding_mask=frame_qns_mask, \
@@ -404,7 +539,8 @@ class VideoQAmodel(nn.Module):
                 "mem": mem,
                 "mem_pool": mem_pool,
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                **selector_aux,
             }
 
         if q_family_id is not None:
@@ -495,9 +631,12 @@ class VideoQAmodel(nn.Module):
         # Hierarchy grouping
         frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
         
+        # Sparse temporal relation reasoning over the selected events
+        frame_obj = frame_obj.view(B, self.frame_topK, -1)
+        frame_obj, selector_aux = self.temporal_relation(frame_obj, idx_frame)
+
         # Overall fusion
         frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
-        frame_obj = frame_obj.view(B, self.frame_topK, -1)
         frame_qns_mask = torch.cat((frame_mask, q_mask), dim=1).bool()
         
         mem = self.vl_encoder(
@@ -525,7 +664,8 @@ class VideoQAmodel(nn.Module):
                 "mem": mem,
                 "mem_pool": mem_pool,
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                **selector_aux,
             }
 
         if q_family_id is not None:
