@@ -82,11 +82,11 @@ class VideoQAmodel(nn.Module):
             dropout=kwargs['dropout'])
 
         # ---- Object feature path ----
-        # When using GroundingDINO+FasterRCNN raw features (2820-d = ROI 2048 +
-        # DeBERTa cls 768 + bbox 4), a single LayerNorm(2820) lets the 2816
-        # semantic dims dominate the 4 bbox dims and effectively erases spatial
-        # information. We instead split:
-        #   sem  = [..., :2816]  -> LayerNorm + Linear -> d_model
+        # With GroundingDINO+SigLIP2 raw features (1540-d = ROI 768 +
+        # DeBERTa cls 768 + bbox 4), keep semantic and spatial inputs separate.
+        # A single LayerNorm over semantic+bbox features can erase spatial
+        # information, so we split:
+        #   sem  = [..., :1536]  -> LayerNorm + Linear -> d_model
         #   bbox = [..., -4:]    -> 2D sinusoidal pos embed -> d_model
         # Then sum + LayerNorm. Controlled by obj_use_bbox_pos_embed.
         self.obj_bbox_dim = int(obj_bbox_dim)
@@ -235,7 +235,7 @@ class VideoQAmodel(nn.Module):
 
     def _fit_obj_feat_dim(self, obj_feat):
         """Pad or truncate object features to the width expected downstream.
-        When obj_use_bbox_pos_embed is True, target = sem_dim + bbox_dim (e.g. 2816+4=2820);
+        When obj_use_bbox_pos_embed is True, target = sem_dim + bbox_dim (e.g. 1536+4=1540);
         otherwise target = obj_resize.fc.in_features.
         """
         if self.obj_use_bbox_pos_embed:

@@ -18,7 +18,8 @@ FAMILY_TO_ID = {
     'counterfactual_reason': 5,
 }
 
-GDINO_ROI_DIM = 2048
+# GroundingDINO boxes + SigLIP2 ROI features (NB3_sigLIP2_add_feature_colab).
+GDINO_ROI_DIM = 768
 GDINO_CLS_DIM = 768
 GDINO_BBOX_DIM = 4
 GDINO_OBJ_DIM = GDINO_ROI_DIM + GDINO_CLS_DIM + GDINO_BBOX_DIM
@@ -304,15 +305,15 @@ class VideoQADataset(Dataset):
 
     def _load_gdino_object_features(self, vid):
         """
-        Load GroundingDINO + FasterRCNN ROI features from pickle.
+        Load GroundingDINO + SigLIP2 ROI features from pickle.
 
         Schema (per frame):
-            roi_features:          [N, 2048]  (FasterRCNN res5 mean-pool)
+            roi_features:          [N, 768]   (SigLIP2 normalized image embedding)
             class_text_embedding:  [N, 768]   (DeBERTa-v3 CLS over label string)
             boxes_xyxy_orig:       [N, 4]     (in original image px)
 
         Returns:
-            torch.Tensor: [topK_frame, obj_num, 2820] = 2048 + 768 + 4
+            torch.Tensor: [topK_frame, obj_num, 1540] = 768 + 768 + 4
             (Raw concat — LayerNorm is applied inside the model.)
         """
         pkl_path = self.gdino_feature_map.get(vid)
@@ -389,7 +390,7 @@ class VideoQADataset(Dataset):
                     cls_emb = np.nan_to_num(cls_emb, nan=0.0, posinf=0.0, neginf=0.0)
                     boxes_norm = np.nan_to_num(boxes_norm, nan=0.0, posinf=1.0, neginf=0.0)
 
-                # Concat: [N, 2048] + [N, 768] + [N, 4] = [N, 2820]
+                # Concat: [N, 768] + [N, 768] + [N, 4] = [N, 1540]
                 if n_det > 0:
                     obj_feat = np.concatenate([roi_feats, cls_emb, boxes_norm], axis=-1)
                 else:
@@ -411,7 +412,7 @@ class VideoQADataset(Dataset):
             while len(objs) < self.topK_frame:
                 objs.append(torch.zeros(self.obj_num, GDINO_OBJ_DIM))
 
-            return torch.stack(objs)  # [topK_frame, obj_num, 2820]
+            return torch.stack(objs)  # [topK_frame, obj_num, 1540]
 
         except Exception:
             return torch.zeros(self.topK_frame, self.obj_num, GDINO_OBJ_DIM)
