@@ -156,7 +156,8 @@ class VideoQAmodel(nn.Module):
                         use_lora=False, lora_r=8, lora_alpha=16, lora_dropout=0.1,
                         lora_target_modules=None,
                         obj_use_bbox_pos_embed=True, obj_hard_gather_from_frame=True,
-                        obj_bbox_dim=4, **kwargs):
+                        obj_bbox_dim=4, obj_split_siglip2=False,
+                        obj_roi_dim=768, obj_class_dim=768, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -213,6 +214,10 @@ class VideoQAmodel(nn.Module):
         self.obj_bbox_dim = int(obj_bbox_dim)
         self.obj_use_bbox_pos_embed = bool(obj_use_bbox_pos_embed) and bool(use_grounding_dino)
         self.obj_hard_gather_from_frame = bool(obj_hard_gather_from_frame) and bool(use_grounding_dino)
+        self.obj_split_siglip2 = bool(obj_split_siglip2) and self.obj_use_bbox_pos_embed
+        self.obj_roi_dim = int(obj_roi_dim)
+        self.obj_class_dim = int(obj_class_dim)
+        self.obj_expected_dim = int(obj_feat_dim)
 
         if self.obj_use_bbox_pos_embed:
             sem_dim = int(obj_feat_dim) - self.obj_bbox_dim
@@ -220,13 +225,20 @@ class VideoQAmodel(nn.Module):
                 raise ValueError(f"obj_feat_dim ({obj_feat_dim}) must be > obj_bbox_dim ({self.obj_bbox_dim})")
             if self.d_model % 8 != 0:
                 raise ValueError(f"d_model must be divisible by 8 for BBoxPosEmbed2D; got {self.d_model}")
-            # Identity kept for backward-compat with checkpoint loading code paths.
+            if self.obj_split_siglip2 and sem_dim != self.obj_roi_dim + self.obj_class_dim:
+                raise ValueError(
+                    f"SigLIP2 split expects semantic dim {self.obj_roi_dim + self.obj_class_dim}, "
+                    f"got {sem_dim} from obj_feat_dim={obj_feat_dim}"
+                )
             self.obj_pre_norm = nn.Identity()
-            self.obj_sem_norm = nn.LayerNorm(sem_dim)
-            self.obj_resize = FeatureResizer(
-                input_feat_size=sem_dim,
-                output_feat_size=self.d_model,
-                dropout=kwargs['dropout'])
+            if self.obj_split_siglip2:
+                self.obj_roi_norm = nn.LayerNorm(self.obj_roi_dim)
+                self.obj_class_norm = nn.LayerNorm(self.obj_class_dim)
+                self.obj_roi_resize = FeatureResizer(self.obj_roi_dim, self.d_model, kwargs['dropout'])
+                self.obj_class_resize = FeatureResizer(self.obj_class_dim, self.d_model, kwargs['dropout'])
+            else:
+                self.obj_sem_norm = nn.LayerNorm(sem_dim)
+                self.obj_resize = FeatureResizer(sem_dim, self.d_model, kwargs['dropout'])
             self.bbox_pos_embed = BBoxPosEmbed2D(d_model=self.d_model, dropout=kwargs['dropout'])
             self.obj_post_pos_norm = nn.LayerNorm(self.d_model)
         else:
@@ -370,10 +382,7 @@ class VideoQAmodel(nn.Module):
         When obj_use_bbox_pos_embed is True, target = sem_dim + bbox_dim (e.g. 1536+4=1540);
         otherwise target = obj_resize.fc.in_features.
         """
-        if self.obj_use_bbox_pos_embed:
-            expected_dim = self.obj_resize.fc.in_features + self.obj_bbox_dim
-        else:
-            expected_dim = self.obj_resize.fc.in_features
+        expected_dim = self.obj_expected_dim
         current_dim = obj_feat.size(-1)
         if current_dim == expected_dim:
             return obj_feat
@@ -389,12 +398,29 @@ class VideoQAmodel(nn.Module):
         if self.obj_use_bbox_pos_embed:
             sem = obj_feat[..., :-self.obj_bbox_dim]
             bbox = obj_feat[..., -self.obj_bbox_dim:]
-            sem = self.obj_sem_norm(sem)
-            sem_proj = self.obj_resize(sem)
-            bbox_emb = self.bbox_pos_embed(bbox)
-            return self.obj_post_pos_norm(sem_proj + bbox_emb)
-        obj_feat = self.obj_pre_norm(obj_feat)
-        return self.obj_resize(obj_feat)
+            padding_mask = sem.abs().sum(dim=-1).eq(0)
+            if self.obj_split_siglip2:
+                roi = sem[..., :self.obj_roi_dim]
+                class_text = sem[..., self.obj_roi_dim:self.obj_roi_dim + self.obj_class_dim]
+                roi_proj = self.obj_roi_resize(self.obj_roi_norm(roi))
+                class_proj = self.obj_class_resize(self.obj_class_norm(class_text))
+                sem_proj = (roi_proj + class_proj) / math.sqrt(2.0)
+            else:
+                sem_proj = self.obj_resize(self.obj_sem_norm(sem))
+            encoded = self.obj_post_pos_norm(sem_proj + self.bbox_pos_embed(bbox))
+            return encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0), padding_mask
+        padding_mask = obj_feat.abs().sum(dim=-1).eq(0)
+        encoded = self.obj_resize(self.obj_pre_norm(obj_feat))
+        return encoded.masked_fill(padding_mask.unsqueeze(-1), 0.0), padding_mask
+
+    @staticmethod
+    def _valid_attention_mask(padding_mask):
+        # Custom MultiheadAttention uses True=valid (opposite to PyTorch padding masks).
+        valid_mask = ~padding_mask
+        empty_rows = ~valid_mask.any(dim=-1)
+        if empty_rows.any():
+            valid_mask[empty_rows, 0] = True
+        return valid_mask
 
     def _select_obj_by_frame(self, obj_feat, idx_frame):
         """Pick objects of the top-K selected frames.
@@ -472,22 +498,28 @@ class VideoQAmodel(nn.Module):
         # obj: hard-gather (preserves spatial correspondence) or legacy soft-mix
         obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
         obj_feat = self._fit_obj_feat_dim(obj_feat)
-        obj_local = self._encode_objects(obj_feat)
+        obj_local, obj_padding_mask = self._encode_objects(obj_feat)
+        obj_decoder_valid_mask = self._valid_attention_mask(obj_padding_mask.flatten(0, 1))
         
         # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0) if q_mask is not None else None
         
         obj_local, obj_att = self.obj_decoder(obj_local.flatten(0,1),
-                                            q_local_repeated, 
+                                            q_local_repeated,
+                                            tgt_key_padding_mask=obj_decoder_valid_mask,
                                             memory_key_padding_mask=q_mask_repeated,
                                             output_attentions=True
                                             )  # b*16,O,d        #.view(B, F, O, -1) # b,16,O,d
+        obj_local = obj_local.masked_fill(
+            obj_padding_mask.flatten(0, 1).unsqueeze(-1), 0.0
+        )
 
         # GroundingDINO: skip obj_sorter (already filtered by text prompt)
         if self.use_grounding_dino:
             # Use all objects (already relevant from text-prompted detection)
             obj_local = obj_local.view(B, self.frame_topK, O, -1)  # [B, frame_topK, objs, d_model]
+            fo_obj_valid_mask = self._valid_attention_mask(obj_padding_mask.flatten(1, 2))
         else:
             # Original: topK object selection via attention
             if self.training:
@@ -498,11 +530,13 @@ class VideoQAmodel(nn.Module):
                 else:
                     idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
             obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+            fo_obj_valid_mask = None
 
 
         ### hierarchy grouping
         frame_obj = self.fo_decoder(frame_local,
                                     obj_local.flatten(1,2),
+                                    memory_key_padding_mask=fo_obj_valid_mask,
                                     # query_pos = self.pos_encoder_1d(frame_mask.view(B,F), self.d_model), \
                                     # memory_key_padding_mask=self.win_mask.unsqueeze(0).repeat(B,1,1).to(device)
                                     ) # b,16,d
@@ -602,7 +636,8 @@ class VideoQAmodel(nn.Module):
         # Object processing (hard-gather + bbox pos-embed when enabled)
         obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
         obj_feat = self._fit_obj_feat_dim(obj_feat)
-        obj_local = self._encode_objects(obj_feat)
+        obj_local, obj_padding_mask = self._encode_objects(obj_feat)
+        obj_decoder_valid_mask = self._valid_attention_mask(obj_padding_mask.flatten(0, 1))
         
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0)
@@ -610,12 +645,17 @@ class VideoQAmodel(nn.Module):
         obj_local, obj_att = self.obj_decoder(
             obj_local.flatten(0,1),
             q_local_repeated,
+            tgt_key_padding_mask=obj_decoder_valid_mask,
             memory_key_padding_mask=q_mask_repeated,
             output_attentions=True
+        )
+        obj_local = obj_local.masked_fill(
+            obj_padding_mask.flatten(0, 1).unsqueeze(-1), 0.0
         )
         
         if self.use_grounding_dino:
             obj_local = obj_local.view(B, self.frame_topK, O, -1)
+            fo_obj_valid_mask = self._valid_attention_mask(obj_padding_mask.flatten(1, 2))
         else:
             # TopK object selection
             if self.training:
@@ -627,9 +667,14 @@ class VideoQAmodel(nn.Module):
                     idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
             
             obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
+            fo_obj_valid_mask = None
         
         # Hierarchy grouping
-        frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
+        frame_obj = self.fo_decoder(
+            frame_local,
+            obj_local.flatten(1,2),
+            memory_key_padding_mask=fo_obj_valid_mask,
+        )
         
         # Sparse temporal relation reasoning over the selected events
         frame_obj = frame_obj.view(B, self.frame_topK, -1)
