@@ -440,6 +440,45 @@ class VideoQAmodel(nn.Module):
         # Soft-mix (legacy): obj_feat[b,f,o,d] @ idx_frame[b,f,k] -> [b,k,o,d]
         return (obj_feat.flatten(-2, -1).transpose(1, 2) @ idx_frame).transpose(1, 2).view(B, K, O, D)
 
+    def _fuse_frame_objects_local(self, frame_local, obj_local, obj_padding_mask=None):
+        """Fuse each selected frame only with objects from that same frame.
+
+        K is folded into the batch, so fo_decoder cannot mix objects across
+        events. Cross-event interaction happens later in temporal_relation.
+        """
+        if frame_local.dim() != 3 or obj_local.dim() != 4:
+            raise ValueError(
+                "Local fusion expects frame_local [B,K,D] and obj_local [B,K,O,D], "
+                f"got {tuple(frame_local.shape)} and {tuple(obj_local.shape)}"
+            )
+
+        B, K, D = frame_local.shape
+        obj_B, obj_K, O, obj_D = obj_local.shape
+        if (obj_B, obj_K, obj_D) != (B, K, D):
+            raise ValueError(
+                "Frame/object dimensions are not aligned for local fusion: "
+                f"frame={tuple(frame_local.shape)}, object={tuple(obj_local.shape)}"
+            )
+
+        frame_query = frame_local.reshape(B * K, 1, D)
+        object_memory = obj_local.reshape(B * K, O, D)
+        memory_valid_mask = None
+        if obj_padding_mask is not None:
+            if tuple(obj_padding_mask.shape) != (B, K, O):
+                raise ValueError(
+                    f"obj_padding_mask must be [B,K,O], got {tuple(obj_padding_mask.shape)}"
+                )
+            memory_valid_mask = self._valid_attention_mask(
+                obj_padding_mask.reshape(B * K, O)
+            )
+
+        event_tokens = self.fo_decoder(
+            frame_query,
+            object_memory,
+            memory_key_padding_mask=memory_valid_mask,
+        )
+        return event_tokens.reshape(B, K, D)
+
     def forward_with_knowledge(self, frame_feat, obj_feat, qns_word, ans_word, q_family_id, knowledge_feat=None):
         """Knowledge-aware forward that returns detailed scores for reranking/training."""
         aux = self.forward(
@@ -519,7 +558,7 @@ class VideoQAmodel(nn.Module):
         if self.use_grounding_dino:
             # Use all objects (already relevant from text-prompted detection)
             obj_local = obj_local.view(B, self.frame_topK, O, -1)  # [B, frame_topK, objs, d_model]
-            fo_obj_valid_mask = self._valid_attention_mask(obj_padding_mask.flatten(1, 2))
+            fo_obj_padding_mask = obj_padding_mask
         else:
             # Original: topK object selection via attention
             if self.training:
@@ -530,16 +569,15 @@ class VideoQAmodel(nn.Module):
                 else:
                     idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
             obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
-            fo_obj_valid_mask = None
+            fo_obj_padding_mask = None
 
 
         ### hierarchy grouping
-        frame_obj = self.fo_decoder(frame_local,
-                                    obj_local.flatten(1,2),
-                                    memory_key_padding_mask=fo_obj_valid_mask,
-                                    # query_pos = self.pos_encoder_1d(frame_mask.view(B,F), self.d_model), \
-                                    # memory_key_padding_mask=self.win_mask.unsqueeze(0).repeat(B,1,1).to(device)
-                                    ) # b,16,d
+        frame_obj = self._fuse_frame_objects_local(
+            frame_local,
+            obj_local,
+            obj_padding_mask=fo_obj_padding_mask,
+        )  # [B, K, D], each event uses only objects from its own frame
         
         ### sparse temporal relation reasoning over the selected events
         frame_obj = frame_obj.view(B, self.frame_topK, -1)
@@ -655,7 +693,7 @@ class VideoQAmodel(nn.Module):
         
         if self.use_grounding_dino:
             obj_local = obj_local.view(B, self.frame_topK, O, -1)
-            fo_obj_valid_mask = self._valid_attention_mask(obj_padding_mask.flatten(1, 2))
+            fo_obj_padding_mask = obj_padding_mask
         else:
             # TopK object selection
             if self.training:
@@ -667,13 +705,13 @@ class VideoQAmodel(nn.Module):
                     idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
             
             obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
-            fo_obj_valid_mask = None
+            fo_obj_padding_mask = None
         
         # Hierarchy grouping
-        frame_obj = self.fo_decoder(
+        frame_obj = self._fuse_frame_objects_local(
             frame_local,
-            obj_local.flatten(1,2),
-            memory_key_padding_mask=fo_obj_valid_mask,
+            obj_local,
+            obj_padding_mask=fo_obj_padding_mask,
         )
         
         # Sparse temporal relation reasoning over the selected events
