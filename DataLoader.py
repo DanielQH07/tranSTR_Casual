@@ -25,6 +25,108 @@ GDINO_BBOX_DIM = 4
 GDINO_OBJ_DIM = GDINO_ROI_DIM + GDINO_CLS_DIM + GDINO_BBOX_DIM
 
 
+class SparseDynamicsDataset(Dataset):
+    """Unique-video DINO windows for answer-agnostic future prediction."""
+
+    def __init__(
+        self,
+        video_feature_path,
+        video_ids,
+        frame_count=16,
+        context_frames=4,
+        windows_per_video=4,
+        feature_dim=1024,
+        seed=999,
+        training=True,
+    ):
+        super().__init__()
+        if context_frames + 1 > frame_count:
+            raise ValueError("context_frames + target must fit inside frame_count")
+        self.video_feature_path = str(video_feature_path)
+        self.frame_count = int(frame_count)
+        self.context_frames = int(context_frames)
+        self.windows_per_video = int(windows_per_video)
+        self.feature_dim = int(feature_dim)
+        self.seed = int(seed)
+        self.training = bool(training)
+        self.epoch = 0
+        self.video_ids = [
+            str(video_id)
+            for video_id in sorted(set(map(str, video_ids)))
+            if osp.exists(osp.join(self.video_feature_path, f"{video_id}.pt"))
+        ]
+        if not self.video_ids:
+            raise ValueError("SparseDynamicsDataset found no DINO feature files")
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return len(self.video_ids) * self.windows_per_video
+
+    def _load_feature(self, video_id):
+        path = osp.join(self.video_feature_path, f"{video_id}.pt")
+        try:
+            feature = torch.load(path, weights_only=True)
+        except TypeError:
+            feature = torch.load(path)
+        if isinstance(feature, np.ndarray):
+            feature = torch.from_numpy(feature)
+        feature = torch.as_tensor(feature).float()
+        if feature.dim() != 2:
+            raise ValueError(f"Expected rank-2 DINO feature at {path}")
+        feature = torch.nan_to_num(feature, nan=0.0, posinf=0.0, neginf=0.0)
+        if feature.size(-1) > self.feature_dim:
+            feature = feature[:, :self.feature_dim]
+        elif feature.size(-1) < self.feature_dim:
+            feature = torch.nn.functional.pad(
+                feature, (0, self.feature_dim - feature.size(-1))
+            )
+        if feature.size(0) == 0:
+            feature = torch.zeros(1, self.feature_dim)
+        if feature.size(0) != self.frame_count:
+            indices = torch.linspace(
+                0, feature.size(0) - 1, self.frame_count
+            ).round().long()
+            feature = feature[indices]
+        return feature
+
+    def _sample_indices(self, video_index, window_index):
+        epoch = self.epoch if self.training else 0
+        sample_seed = (
+            self.seed
+            + epoch * 1000003
+            + video_index * 1009
+            + window_index * 97
+        )
+        rng = np.random.default_rng(sample_seed)
+        indices = np.sort(
+            rng.choice(
+                self.frame_count,
+                size=self.context_frames + 1,
+                replace=False,
+            )
+        ).astype(np.int64)
+        return indices
+
+    def __getitem__(self, index):
+        video_index = int(index) // self.windows_per_video
+        window_index = int(index) % self.windows_per_video
+        video_id = self.video_ids[video_index]
+        feature = self._load_feature(video_id)
+        indices = self._sample_indices(video_index, window_index)
+        context_indices = torch.from_numpy(indices[:-1]).long()
+        target_index = int(indices[-1])
+        time_axis = torch.linspace(0.0, 1.0, self.frame_count)
+        return (
+            feature[context_indices],
+            time_axis[context_indices],
+            feature[target_index],
+            time_axis[target_index],
+            video_id,
+        )
+
+
 class VideoQADataset(Dataset):
     def __init__(self, split, n_query=5, obj_num=10, sample_list_path="", 
                  video_feature_path="", object_feature_path="", split_dir=None, 

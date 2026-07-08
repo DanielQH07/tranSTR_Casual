@@ -149,6 +149,105 @@ class SparseTemporalRelation(nn.Module):
         return event_tokens, diagnostics
 
 
+class SparseFuturePredictor(nn.Module):
+    """Predict a future DINO latent from four sparse chronological latents.
+
+    This module is deliberately text/answer agnostic. It is pretrained on
+    unique videos, then frozen before being attached to VideoQAmodel.
+    """
+
+    def __init__(
+        self,
+        input_dim=1024,
+        hidden_dim=512,
+        num_layers=2,
+        nheads=8,
+        dim_feedforward=1024,
+        dropout=0.1,
+    ):
+        super().__init__()
+        if hidden_dim % nheads != 0:
+            raise ValueError(
+                f"world hidden_dim ({hidden_dim}) must be divisible by nheads ({nheads})"
+            )
+        self.input_dim = int(input_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.input_norm = nn.LayerNorm(self.input_dim)
+        self.input_proj = nn.Linear(self.input_dim, self.hidden_dim)
+        self.time_encoder = ContinuousTimeEncoding(self.hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.hidden_dim,
+            nhead=nheads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.context_encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_layers,
+            norm=nn.LayerNorm(self.hidden_dim),
+        )
+        self.future_query = nn.Parameter(torch.zeros(1, 1, self.hidden_dim))
+        nn.init.normal_(self.future_query, std=0.02)
+        self.future_attention = nn.MultiheadAttention(
+            self.hidden_dim,
+            nheads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.output_norm = nn.LayerNorm(self.hidden_dim)
+        self.output_proj = nn.Linear(self.hidden_dim, self.input_dim)
+
+    def forward(
+        self,
+        context_feat,
+        context_time,
+        target_time,
+        context_valid_mask=None,
+    ):
+        if context_feat.dim() != 3:
+            raise ValueError(
+                f"context_feat must be [B,C,D], got {tuple(context_feat.shape)}"
+            )
+        if context_feat.size(-1) != self.input_dim:
+            raise ValueError(
+                f"Expected future input dim {self.input_dim}, got {context_feat.size(-1)}"
+            )
+        if context_time.shape != context_feat.shape[:2]:
+            raise ValueError(
+                "context_time must match context_feat[:2], got "
+                f"{tuple(context_time.shape)} vs {tuple(context_feat.shape[:2])}"
+            )
+        target_time = target_time.view(-1)
+        if target_time.size(0) != context_feat.size(0):
+            raise ValueError("target_time must contain one timestamp per sample")
+
+        context = self.input_proj(self.input_norm(context_feat))
+        context = context + self.time_encoder(context_time).to(context.dtype)
+        padding_mask = None
+        if context_valid_mask is not None:
+            context_valid_mask = context_valid_mask.bool()
+            if context_valid_mask.shape != context_feat.shape[:2]:
+                raise ValueError("context_valid_mask must be [B,C]")
+            padding_mask = ~context_valid_mask
+        context = self.context_encoder(
+            context,
+            src_key_padding_mask=padding_mask,
+        )
+        query = self.future_query.expand(context_feat.size(0), -1, -1)
+        query = query + self.time_encoder(target_time[:, None]).to(query.dtype)
+        future, _ = self.future_attention(
+            query,
+            context,
+            context,
+            key_padding_mask=padding_mask,
+            need_weights=False,
+        )
+        return self.output_proj(self.output_norm(future[:, 0]))
+
+
 class VideoQAmodel(nn.Module):
     def __init__(self, text_encoder_type="roberta-base", freeze_text_encoder = False, n_query=5,
                         objs=20, frames=16, topK_frame=4, topK_obj=5, hard_eval=False, 
@@ -159,6 +258,10 @@ class VideoQAmodel(nn.Module):
                         obj_bbox_dim=4, obj_split_siglip2=False,
                         obj_roi_dim=768, obj_class_dim=768,
                         use_causal_selector=False, causal_selector_hidden=256,
+                        fo_fusion_mode="local", use_sparse_world_model=False,
+                        world_context_frames=4, world_hidden_dim=512,
+                        world_layers=2, world_nheads=8, world_ffn=1024,
+                        world_dropout=0.1,
                         **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
@@ -169,6 +272,13 @@ class VideoQAmodel(nn.Module):
         self.objs = objs
         self.obj_feat_dim = obj_feat_dim
         self.use_causal_selector = bool(use_causal_selector)
+        self.fo_fusion_mode = str(fo_fusion_mode).lower()
+        if self.fo_fusion_mode not in {"local", "global"}:
+            raise ValueError("fo_fusion_mode must be 'local' or 'global'")
+        self.use_sparse_world_model = bool(use_sparse_world_model)
+        self.world_context_frames = int(world_context_frames)
+        self.world_mode = "full"
+        self.world_predictor_frozen = False
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -293,6 +403,59 @@ class VideoQAmodel(nn.Module):
         
         self.vl_encoder = TransformerEncoder(TransformerEncoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
         self.ans_decoder = TransformerDecoder(TransformerDecoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
+
+        if self.use_sparse_world_model:
+            if self.frame_topK < self.world_context_frames + 1:
+                raise ValueError(
+                    "Sparse world model needs at least context_frames + 1 selected frames"
+                )
+            self.world_predictor = SparseFuturePredictor(
+                input_dim=frame_feat_dim,
+                hidden_dim=world_hidden_dim,
+                num_layers=world_layers,
+                nheads=world_nheads,
+                dim_feedforward=world_ffn,
+                dropout=world_dropout,
+            )
+            self.world_feature_resize = FeatureResizer(
+                input_feat_size=frame_feat_dim,
+                output_feat_size=self.d_model,
+                dropout=0.0,
+            )
+            self.world_feature_resize.load_state_dict(
+                self.frame_resize.state_dict()
+            )
+            self.world_question_proj = nn.Linear(self.d_model, self.d_model)
+            self.world_object_proj = nn.Linear(self.d_model, self.d_model)
+            self.world_event_proj = nn.Linear(self.d_model, self.d_model)
+            self.world_delta = nn.Sequential(
+                nn.Linear(self.d_model * 3, world_hidden_dim),
+                nn.GELU(),
+                nn.Linear(world_hidden_dim, frame_feat_dim),
+            )
+            nn.init.zeros_(self.world_delta[-1].weight)
+            nn.init.zeros_(self.world_delta[-1].bias)
+            self.world_cause_query = nn.Linear(
+                self.d_model, self.d_model, bias=False
+            )
+            self.world_cause_key = nn.Linear(
+                self.d_model, self.d_model, bias=False
+            )
+            self.world_type_embedding = nn.Parameter(
+                torch.zeros(3, self.d_model)
+            )
+            nn.init.normal_(self.world_type_embedding, std=0.02)
+            self.world_gate_head = nn.Linear(self.d_model, 2)
+            nn.init.zeros_(self.world_gate_head.weight)
+            nn.init.constant_(self.world_gate_head.bias, -2.0)
+            self.world_decoder = TransformerDecoder(
+                TransformerDecoderLayer(**kwargs),
+                1,
+                norm=nn.LayerNorm(self.d_model),
+            )
+            self.world_output_proj = nn.Linear(self.d_model, self.d_model)
+            nn.init.zeros_(self.world_output_proj.weight)
+            nn.init.zeros_(self.world_output_proj.bias)
 
         # position embedding
         self.pos_encoder_1d = PositionEmbeddingSine1D()
@@ -438,6 +601,37 @@ class VideoQAmodel(nn.Module):
         if empty_rows.any():
             valid_mask[empty_rows, 0] = True
         return valid_mask
+
+    def freeze_world_predictor(self):
+        if not self.use_sparse_world_model:
+            raise RuntimeError("Sparse world model is disabled")
+        for parameter in self.world_predictor.parameters():
+            parameter.requires_grad_(False)
+        self.world_predictor_frozen = True
+        self.world_predictor.eval()
+
+    def load_world_predictor(self, state_dict, strict=True, freeze=True):
+        if not self.use_sparse_world_model:
+            raise RuntimeError("Sparse world model is disabled")
+        result = self.world_predictor.load_state_dict(state_dict, strict=strict)
+        if freeze:
+            self.freeze_world_predictor()
+        return result
+
+    def set_world_mode(self, mode):
+        mode = str(mode).lower()
+        if mode not in {"off", "factual", "full"}:
+            raise ValueError("world mode must be 'off', 'factual', or 'full'")
+        self.world_mode = mode
+
+    def train(self, mode=True):
+        super().train(mode)
+        if (
+            getattr(self, "use_sparse_world_model", False)
+            and getattr(self, "world_predictor_frozen", False)
+        ):
+            self.world_predictor.eval()
+        return self
 
     @staticmethod
     def _masked_mean(tokens, valid_mask):
@@ -610,6 +804,190 @@ class VideoQAmodel(nn.Module):
         )
         return event_tokens.reshape(B, K, D)
 
+    def _fuse_frame_objects(self, frame_local, obj_local, obj_padding_mask=None):
+        if self.fo_fusion_mode == "local":
+            return self._fuse_frame_objects_local(
+                frame_local,
+                obj_local,
+                obj_padding_mask=obj_padding_mask,
+            )
+
+        # v1 behavior: every selected frame query can attend to every selected
+        # object. The custom attention mask uses True=valid.
+        memory_valid_mask = None
+        if obj_padding_mask is not None:
+            memory_valid_mask = self._valid_attention_mask(
+                obj_padding_mask.flatten(1, 2)
+            )
+        return self.fo_decoder(
+            frame_local,
+            obj_local.flatten(1, 2),
+            memory_key_padding_mask=memory_valid_mask,
+        )
+
+    def _apply_sparse_world_model(
+        self,
+        candidate_tgt,
+        baseline_out,
+        q_local,
+        q_mask,
+        frame_feat_raw,
+        obj_local,
+        obj_padding_mask,
+        event_tokens,
+        idx_frame,
+        world_mode=None,
+        world_question_permutation=None,
+    ):
+        if not self.use_sparse_world_model:
+            return baseline_out, {}
+        if self.training and not self.world_predictor_frozen:
+            raise RuntimeError(
+                "Freeze the pretrained world_predictor before QA training"
+            )
+
+        mode = self.world_mode if world_mode is None else str(world_mode).lower()
+        if mode not in {"off", "factual", "full"}:
+            raise ValueError("world_mode must be 'off', 'factual', or 'full'")
+        batch_size, num_frames = frame_feat_raw.shape[:2]
+        topk = idx_frame.size(-1)
+        context_len = self.world_context_frames
+        if topk < context_len + 1:
+            raise ValueError("Not enough selected frames for sparse world rollout")
+
+        q_global = self._masked_mean(q_local, q_mask)
+        world_q = q_global
+        if world_question_permutation is not None:
+            permutation = world_question_permutation.to(q_global.device).long()
+            if permutation.shape != (batch_size,):
+                raise ValueError("world_question_permutation must be [B]")
+            world_q = q_global[permutation]
+
+        # World rollout is intentionally detached from the frame selector.
+        hard_indices = idx_frame.detach().argmax(dim=1)  # [B,K]
+        gather_raw = hard_indices.unsqueeze(-1).expand(
+            -1, -1, frame_feat_raw.size(-1)
+        )
+        selected_raw = torch.gather(frame_feat_raw, 1, gather_raw)
+        selected_time = hard_indices.to(frame_feat_raw.dtype) / max(
+            float(num_frames - 1), 1.0
+        )
+        order = selected_time.argsort(dim=1)
+
+        def gather_slots(tensor):
+            index = order
+            for _ in range(tensor.dim() - 2):
+                index = index.unsqueeze(-1)
+            index = index.expand(-1, -1, *tensor.shape[2:])
+            return torch.gather(tensor, 1, index)
+
+        selected_raw = gather_slots(selected_raw)
+        selected_time = torch.gather(selected_time, 1, order)
+        sorted_objects = gather_slots(obj_local)
+        sorted_obj_padding = gather_slots(obj_padding_mask)
+        sorted_events = gather_slots(event_tokens)
+
+        context_raw = selected_raw[:, :context_len]
+        context_time = selected_time[:, :context_len]
+        target_time = selected_time[:, context_len]
+        context_objects = sorted_objects[:, :context_len]
+        context_obj_padding = sorted_obj_padding[:, :context_len]
+        context_events = sorted_events[:, :context_len]
+
+        if self.world_predictor_frozen:
+            self.world_predictor.eval()
+        with torch.no_grad():
+            factual_raw = self.world_predictor(
+                context_raw,
+                context_time,
+                target_time,
+            )
+
+        q_query = self.world_question_proj(world_q)
+        object_key = self.world_object_proj(context_objects)
+        object_logits = torch.einsum(
+            "bd,bcod->bco", q_query, object_key
+        ) / math.sqrt(float(self.d_model))
+        object_valid = ~context_obj_padding
+        object_mask = torch.sigmoid(object_logits) * object_valid.to(
+            object_logits.dtype
+        )
+        object_denom = object_mask.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        object_summary = (
+            context_objects * object_mask.unsqueeze(-1)
+        ).sum(dim=2) / object_denom
+
+        event_key = self.world_event_proj(context_events)
+        time_logits = torch.einsum(
+            "bd,bcd->bc", q_query, event_key
+        ) / math.sqrt(float(self.d_model))
+        time_mask = torch.sigmoid(time_logits)
+        q_expand = world_q.unsqueeze(1).expand(-1, context_len, -1)
+        delta_raw = self.world_delta(
+            torch.cat((context_events, object_summary, q_expand), dim=-1)
+        )
+        intervened_context = context_raw + time_mask.unsqueeze(-1) * delta_raw
+        counterfactual_raw = self.world_predictor(
+            intervened_context,
+            context_time,
+            target_time,
+        )
+
+        future_pair = torch.stack((factual_raw, counterfactual_raw), dim=1)
+        # A deterministic projection is essential: independent dropout masks
+        # would create a fake factual/counterfactual difference at zero delta.
+        future_pair = self.world_feature_resize(future_pair)
+        factual_token = future_pair[:, 0]
+        counterfactual_token = future_pair[:, 1]
+        change_token = counterfactual_token - factual_token
+        cause_logits = torch.einsum(
+            "bd,bkd->bk",
+            self.world_cause_query(change_token),
+            self.world_cause_key(sorted_events),
+        ) / math.sqrt(float(self.d_model))
+        cause_attention = torch.softmax(cause_logits, dim=1)
+        cause_token = torch.einsum(
+            "bk,bkd->bd", cause_attention, sorted_events
+        )
+
+        gates = torch.sigmoid(self.world_gate_head(world_q))
+        aux = {
+            "world_factual_embedding": factual_token,
+            "world_counterfactual_embedding": counterfactual_token,
+            "world_object_intervention_mask": object_mask,
+            "world_time_intervention_mask": time_mask,
+            "world_gate": gates,
+            "world_delta_norm": delta_raw.norm(dim=-1).mean(dim=1),
+            "world_cause_attention": cause_attention,
+            "world_selected_frame_indices": hard_indices,
+        }
+        if mode == "off":
+            return baseline_out, aux
+
+        if mode == "factual":
+            world_memory = (
+                gates[:, 0, None] * factual_token
+                + self.world_type_embedding[0]
+            ).unsqueeze(1)
+        else:
+            world_memory = torch.stack(
+                (
+                    gates[:, 0, None] * factual_token
+                    + self.world_type_embedding[0],
+                    gates[:, 1, None] * counterfactual_token
+                    + self.world_type_embedding[1],
+                    gates[:, 1, None] * cause_token
+                    + self.world_type_embedding[2],
+                ),
+                dim=1,
+            )
+        world_candidate = self.world_decoder(candidate_tgt, world_memory)
+        world_residual = self.world_output_proj(world_candidate)
+        aux["world_candidate_residual_norm"] = world_residual.norm(
+            dim=-1
+        ).mean(dim=1)
+        return baseline_out + world_residual, aux
+
     def forward_with_knowledge(self, frame_feat, obj_feat, qns_word, ans_word, q_family_id, knowledge_feat=None):
         """Knowledge-aware forward that returns detailed scores for reranking/training."""
         aux = self.forward(
@@ -627,7 +1005,11 @@ class VideoQAmodel(nn.Module):
             aux["fused_score"] = aux["answer_score"]
         return aux
 
-    def forward(self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False, q_family_id=None, knowledge_feat=None):
+    def forward(
+        self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False,
+        q_family_id=None, knowledge_feat=None, world_mode=None,
+        world_question_permutation=None,
+    ):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
         :param obj_feat:[bs, T, O, obj_feat_dim] e.g., [bs, 16, 20, 2053]
@@ -638,6 +1020,7 @@ class VideoQAmodel(nn.Module):
         B, F, O = obj_feat.size()[:3]
         device = frame_feat.device
         
+        frame_feat_raw = frame_feat
         # Resize frame features to d_model
         frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
         
@@ -699,11 +1082,11 @@ class VideoQAmodel(nn.Module):
 
 
         ### hierarchy grouping
-        frame_obj = self._fuse_frame_objects_local(
+        frame_obj = self._fuse_frame_objects(
             frame_local,
             obj_local,
             obj_padding_mask=fo_obj_padding_mask,
-        )  # [B, K, D], each event uses only objects from its own frame
+        )
         
         ### sparse temporal relation reasoning over the selected events
         frame_obj = frame_obj.view(B, self.frame_topK, -1)
@@ -725,7 +1108,27 @@ class VideoQAmodel(nn.Module):
             causal_aux["causal_candidate_embedding"] = torch.nn.functional.normalize(
                 tgt.detach(), p=2, dim=-1, eps=1e-6
             )
-        out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
+        baseline_out = self.ans_decoder(
+            tgt, mem, memory_key_padding_mask=frame_qns_mask
+        )
+        world_obj_padding = fo_obj_padding_mask
+        if world_obj_padding is None:
+            world_obj_padding = torch.zeros(
+                obj_local.shape[:3], dtype=torch.bool, device=obj_local.device
+            )
+        out, world_aux = self._apply_sparse_world_model(
+            candidate_tgt=tgt,
+            baseline_out=baseline_out,
+            q_local=q_local,
+            q_mask=q_mask,
+            frame_feat_raw=frame_feat_raw,
+            obj_local=obj_local,
+            obj_padding_mask=world_obj_padding,
+            event_tokens=frame_obj,
+            idx_frame=idx_frame,
+            world_mode=world_mode,
+            world_question_permutation=world_question_permutation,
+        )
 
         # candidate decoding
         cand_feat, answer_score, evidence_score = self.decode_candidates(out)
@@ -744,6 +1147,7 @@ class VideoQAmodel(nn.Module):
                 "verifier_logits": verifier_logits,
                 **selector_aux,
                 **causal_aux,
+                **world_aux,
             }
 
         if q_family_id is not None:
@@ -759,7 +1163,12 @@ class VideoQAmodel(nn.Module):
             return aux
         return logits
     
-    def forward_cached(self, frame_feat, obj_feat, text_feat, return_aux=False, q_family_id=None, knowledge_feat=None):
+    def forward_cached(
+        self, frame_feat, obj_feat, text_feat, return_aux=False,
+        q_family_id=None, knowledge_feat=None, question_feat=None,
+        question_mask=None, world_mode=None,
+        world_question_permutation=None,
+    ):
         """
         Forward pass using pre-extracted text features (bypasses DeBERTa).
         
@@ -770,17 +1179,31 @@ class VideoQAmodel(nn.Module):
         B, F, O = obj_feat.size()[:3]
         device = frame_feat.device
         
+        frame_feat_raw = frame_feat
         # Resize frame features
         frame_feat = self.frame_resize(frame_feat)  # [B, F, d_model]
         
         # Project cached text features (768 -> d_model)
         text_feat_proj = self.text_proj(text_feat)  # [B, 5, d_model]
         
-        # Use MEAN of 5 choices as question representation for video attention
-        # This approximates the question since all choices share the same question
-        q_local = text_feat_proj.mean(dim=1, keepdim=True)  # [B, 1, d_model]
-        # Custom attention masks use True=valid.
-        q_mask = torch.ones(B, 1, device=device, dtype=torch.bool)
+        if question_feat is not None:
+            question_feat = question_feat.to(device)
+            q_local = self.text_proj(question_feat)
+            q_mask = (
+                question_mask.to(device).bool()
+                if question_mask is not None
+                else torch.ones(
+                    q_local.shape[:2], device=device, dtype=torch.bool
+                )
+            )
+        else:
+            if self.use_sparse_world_model:
+                raise ValueError(
+                    "forward_cached requires question_feat when sparse world model is enabled"
+                )
+            # Legacy fallback for checkpoints without the world branch.
+            q_local = text_feat_proj.mean(dim=1, keepdim=True)
+            q_mask = torch.ones(B, 1, device=device, dtype=torch.bool)
         
         # Frame decoder with question
         frame_mask = torch.ones(B, F).bool().to(device)
@@ -834,7 +1257,7 @@ class VideoQAmodel(nn.Module):
             fo_obj_padding_mask = None
         
         # Hierarchy grouping
-        frame_obj = self._fuse_frame_objects_local(
+        frame_obj = self._fuse_frame_objects(
             frame_local,
             obj_local,
             obj_padding_mask=fo_obj_padding_mask,
@@ -861,7 +1284,27 @@ class VideoQAmodel(nn.Module):
             causal_aux["causal_candidate_embedding"] = torch.nn.functional.normalize(
                 tgt.detach(), p=2, dim=-1, eps=1e-6
             )
-        out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
+        baseline_out = self.ans_decoder(
+            tgt, mem, memory_key_padding_mask=frame_qns_mask
+        )
+        world_obj_padding = fo_obj_padding_mask
+        if world_obj_padding is None:
+            world_obj_padding = torch.zeros(
+                obj_local.shape[:3], dtype=torch.bool, device=obj_local.device
+            )
+        out, world_aux = self._apply_sparse_world_model(
+            candidate_tgt=tgt,
+            baseline_out=baseline_out,
+            q_local=q_local,
+            q_mask=q_mask,
+            frame_feat_raw=frame_feat_raw,
+            obj_local=obj_local,
+            obj_padding_mask=world_obj_padding,
+            event_tokens=frame_obj,
+            idx_frame=idx_frame,
+            world_mode=world_mode,
+            world_question_permutation=world_question_permutation,
+        )
         
         # candidate decoding
         cand_feat, answer_score, evidence_score = self.decode_candidates(out)
@@ -880,6 +1323,7 @@ class VideoQAmodel(nn.Module):
                 "verifier_logits": verifier_logits,
                 **selector_aux,
                 **causal_aux,
+                **world_aux,
             }
 
         if q_family_id is not None:
