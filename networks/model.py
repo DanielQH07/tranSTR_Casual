@@ -199,6 +199,12 @@ class SparseFuturePredictor(nn.Module):
         )
         self.output_norm = nn.LayerNorm(self.hidden_dim)
         self.output_proj = nn.Linear(self.hidden_dim, self.input_dim)
+        # Copy-last anchored residual predictor. DINO frame latents are highly
+        # smooth; a plain predictor can easily underperform "use the latest
+        # observed frame". Zero init makes the initial model exactly copy-last,
+        # and pretraining only learns a residual when it improves validation.
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
 
     def forward(
         self,
@@ -245,7 +251,7 @@ class SparseFuturePredictor(nn.Module):
             key_padding_mask=padding_mask,
             need_weights=False,
         )
-        return self.output_proj(self.output_norm(future[:, 0]))
+        return context_feat[:, -1] + self.output_proj(self.output_norm(future[:, 0]))
 
 
 class VideoQAmodel(nn.Module):
