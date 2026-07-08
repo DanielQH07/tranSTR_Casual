@@ -157,7 +157,9 @@ class VideoQAmodel(nn.Module):
                         lora_target_modules=None,
                         obj_use_bbox_pos_embed=True, obj_hard_gather_from_frame=True,
                         obj_bbox_dim=4, obj_split_siglip2=False,
-                        obj_roi_dim=768, obj_class_dim=768, **kwargs):
+                        obj_roi_dim=768, obj_class_dim=768,
+                        use_causal_selector=False, causal_selector_hidden=256,
+                        **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -166,6 +168,7 @@ class VideoQAmodel(nn.Module):
         self.use_grounding_dino = use_grounding_dino
         self.objs = objs
         self.obj_feat_dim = obj_feat_dim
+        self.use_causal_selector = bool(use_causal_selector)
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -264,6 +267,20 @@ class VideoQAmodel(nn.Module):
         # Add text projection layer (BERT 768 -> d_model)
         self.text_proj = nn.Linear(768, self.d_model)
         self.frame_sorter = PerturbedTopK(self.frame_topK)
+
+        # Keep these modules strictly opt-in so a v2 checkpoint can still be
+        # strict-loaded when use_causal_selector=False.
+        if self.use_causal_selector:
+            selector_hidden = int(causal_selector_hidden)
+            self.frame_relevance_frame = nn.Linear(self.d_model, selector_hidden)
+            self.frame_relevance_question = nn.Linear(self.d_model, selector_hidden)
+            self.frame_relevance_head = nn.Linear(selector_hidden, 1)
+            # Shared projection prevents the positive/complement comparison
+            # from being solved by two unrelated embedding spaces.
+            self.causal_frame_projection = nn.Sequential(
+                nn.Linear(self.d_model, self.d_model),
+                nn.LayerNorm(self.d_model),
+            )
         
         # obj_sorter only if NOT using GroundingDINO (already filtered by text prompt)
         if not use_grounding_dino:
@@ -422,6 +439,120 @@ class VideoQAmodel(nn.Module):
             valid_mask[empty_rows, 0] = True
         return valid_mask
 
+    @staticmethod
+    def _masked_mean(tokens, valid_mask):
+        """Mean-pool tokens where True means valid."""
+        if valid_mask is None:
+            return tokens.mean(dim=1)
+        valid = valid_mask.to(dtype=tokens.dtype).unsqueeze(-1)
+        return (tokens * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+
+    @staticmethod
+    def _normalize_selection(selection):
+        return selection / selection.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+    @staticmethod
+    def _hard_positive_complement_overlap(positive, complement):
+        """Fraction of positive hard frame indices also in the complement."""
+        positive_idx = positive.argmax(dim=1)
+        complement_idx = complement.argmax(dim=1)
+        overlap = (
+            positive_idx.unsqueeze(-1) == complement_idx.unsqueeze(1)
+        ).any(dim=-1)
+        return overlap.float().mean(dim=1)
+
+    def _hard_causal_topk(self, relevance_score):
+        """Deterministic disjoint Top-K and Bottom-K, including score ties."""
+        positive = HardtopK(relevance_score, self.frame_topK)
+        positive_mask = positive.sum(dim=-1).bool()
+        complement_score = (-relevance_score).masked_fill(
+            positive_mask, torch.finfo(relevance_score.dtype).min
+        )
+        complement = HardtopK(complement_score, self.frame_topK)
+        return positive, complement
+
+    def _select_frame_evidence(
+        self, frame_local, frame_att, q_local, q_mask,
+        causal_frame_source=None,
+    ):
+        """Select positive Top-K frames and optional causal complement.
+
+        The legacy path is intentionally byte-for-byte equivalent in its
+        selector computation. The causal path scores each frame with a scalar
+        conditioned on a masked global question representation.
+        """
+        num_frames = frame_local.size(1)
+        causal_aux = {}
+
+        if not self.use_causal_selector:
+            legacy_score = frame_att.flatten(1, 2)
+            if self.training or not self.hard_eval:
+                flat_selection = self.frame_sorter(legacy_score)
+            else:
+                flat_selection = HardtopK(legacy_score, self.frame_topK)
+            positive = rearrange(
+                flat_selection,
+                'b (f q) k -> b f q k',
+                f=num_frames,
+            ).sum(-2)
+            selected_frames = (
+                frame_local.transpose(1, 2) @ positive
+            ).transpose(1, 2)
+            return selected_frames, positive, causal_aux
+
+        # The causal branch must not update the text encoder. It learns the
+        # question projection from detached text features and the visual path
+        # from the resized frame source. The answer path below still uses the
+        # question-conditioned frame_decoder output normally.
+        q_global = self._masked_mean(q_local.detach(), q_mask)
+        if causal_frame_source is None:
+            causal_frame_source = frame_local
+        relevance_score = self.frame_relevance_head(
+            torch.tanh(
+                self.frame_relevance_frame(causal_frame_source)
+                + self.frame_relevance_question(q_global).unsqueeze(1)
+            )
+        ).squeeze(-1)
+
+        if self.training or not self.hard_eval:
+            positive = self.frame_sorter(relevance_score)
+            complement = self.frame_sorter(-relevance_score)
+        else:
+            positive, complement = self._hard_causal_topk(relevance_score)
+
+        selected_frames = (
+            frame_local.transpose(1, 2) @ positive
+        ).transpose(1, 2)
+        complement_frames = (
+            causal_frame_source.transpose(1, 2) @ complement
+        ).transpose(1, 2)
+        positive_causal_frames = (
+            causal_frame_source.transpose(1, 2) @ positive
+        ).transpose(1, 2)
+
+        positive_embedding = F.normalize(
+            self.causal_frame_projection(positive_causal_frames.mean(dim=1)),
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        complement_embedding = F.normalize(
+            self.causal_frame_projection(complement_frames.mean(dim=1)),
+            p=2,
+            dim=-1,
+            eps=1e-6,
+        )
+        causal_aux = {
+            "frame_relevance_score": relevance_score,
+            "complement_selection_prob": self._normalize_selection(complement),
+            "causal_positive_embedding": positive_embedding,
+            "causal_complement_embedding": complement_embedding,
+            "positive_complement_overlap": self._hard_positive_complement_overlap(
+                positive, complement
+            ),
+        }
+        return selected_frames, positive, causal_aux
+
     def _select_obj_by_frame(self, obj_feat, idx_frame):
         """Pick objects of the top-K selected frames.
         - Hard path (obj_hard_gather_from_frame=True): gather using argmax of
@@ -524,15 +655,10 @@ class VideoQAmodel(nn.Module):
                                     output_attentions=True
                                     ) # b,16,d
         
-        if self.training:
-            idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
-        else:
-            if self.hard_eval:
-                idx_frame = rearrange(HardtopK(frame_att.flatten(1,2), self.frame_topK), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
-            else:
-                idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
-
-        frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2) # B, Frame_K, d)
+        frame_local, idx_frame, causal_aux = self._select_frame_evidence(
+            frame_local, frame_att, q_local, q_mask,
+            causal_frame_source=frame_feat,
+        )
 
         # obj: hard-gather (preserves spatial correspondence) or legacy soft-mix
         obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
@@ -595,6 +721,10 @@ class VideoQAmodel(nn.Module):
         a_seq, _ = self.forward_text(list(chain(*ans_word)), device, has_ans=True)
         a_seq = rearrange(a_seq, '(n b) t c -> b n t c', b=B)
         tgt = a_seq[:,:,0,:] # [CLS] # [batch, n_query, d_model]
+        if self.use_causal_selector:
+            causal_aux["causal_candidate_embedding"] = torch.nn.functional.normalize(
+                tgt.detach(), p=2, dim=-1, eps=1e-6
+            )
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
 
         # candidate decoding
@@ -613,6 +743,7 @@ class VideoQAmodel(nn.Module):
                 "logits": logits,
                 "verifier_logits": verifier_logits,
                 **selector_aux,
+                **causal_aux,
             }
 
         if q_family_id is not None:
@@ -648,7 +779,8 @@ class VideoQAmodel(nn.Module):
         # Use MEAN of 5 choices as question representation for video attention
         # This approximates the question since all choices share the same question
         q_local = text_feat_proj.mean(dim=1, keepdim=True)  # [B, 1, d_model]
-        q_mask = torch.zeros(B, 1, device=device).bool()
+        # Custom attention masks use True=valid.
+        q_mask = torch.ones(B, 1, device=device, dtype=torch.bool)
         
         # Frame decoder with question
         frame_mask = torch.ones(B, F).bool().to(device)
@@ -660,16 +792,10 @@ class VideoQAmodel(nn.Module):
             output_attentions=True
         )
         
-        # TopK frame selection
-        if self.training:
-            idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2)
-        else:
-            if self.hard_eval:
-                idx_frame = rearrange(HardtopK(frame_att.flatten(1,2), self.frame_topK), 'b (f q) k -> b f q k', f=F).sum(-2)
-            else:
-                idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2)
-        
-        frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2)
+        frame_local, idx_frame, causal_aux = self._select_frame_evidence(
+            frame_local, frame_att, q_local, q_mask,
+            causal_frame_source=frame_feat,
+        )
         
         # Object processing (hard-gather + bbox pos-embed when enabled)
         obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
@@ -731,6 +857,10 @@ class VideoQAmodel(nn.Module):
         # Answer decoding - use individual QA features as answer queries
         # text_feat_proj is [B, 5, d_model] - each is [CLS] of "question + answer_i"
         tgt = text_feat_proj  # [B, 5, d_model]
+        if self.use_causal_selector:
+            causal_aux["causal_candidate_embedding"] = torch.nn.functional.normalize(
+                tgt.detach(), p=2, dim=-1, eps=1e-6
+            )
         out = self.ans_decoder(tgt, mem, memory_key_padding_mask=frame_qns_mask)
         
         # candidate decoding
@@ -749,6 +879,7 @@ class VideoQAmodel(nn.Module):
                 "logits": logits,
                 "verifier_logits": verifier_logits,
                 **selector_aux,
+                **causal_aux,
             }
 
         if q_family_id is not None:
