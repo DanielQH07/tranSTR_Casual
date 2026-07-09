@@ -268,6 +268,8 @@ class VideoQAmodel(nn.Module):
                         world_context_frames=4, world_hidden_dim=512,
                         world_layers=2, world_nheads=8, world_ffn=1024,
                         world_dropout=0.1,
+                        use_candidate_grounding=False,
+                        candidate_grounding_alpha=0.3,
                         **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
@@ -285,6 +287,9 @@ class VideoQAmodel(nn.Module):
         self.world_context_frames = int(world_context_frames)
         self.world_mode = "full"
         self.world_predictor_frozen = False
+        self.use_candidate_grounding = bool(use_candidate_grounding)
+        self.candidate_grounding_alpha = float(candidate_grounding_alpha)
+        self.candidate_grounding_mode = "answer_plus_grounding"
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -409,6 +414,18 @@ class VideoQAmodel(nn.Module):
         
         self.vl_encoder = TransformerEncoder(TransformerEncoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
         self.ans_decoder = TransformerDecoder(TransformerDecoderLayer(**kwargs), kwargs['num_encoder_layers'],norm=nn.LayerNorm(self.d_model))
+
+        if self.use_candidate_grounding:
+            self.candidate_grounding_q = nn.Linear(self.d_model, self.d_model, bias=False)
+            self.candidate_grounding_k = nn.Linear(self.d_model, self.d_model, bias=False)
+            self.candidate_grounding_v = nn.Linear(self.d_model, self.d_model, bias=False)
+            self.candidate_grounding_norm = nn.LayerNorm(self.d_model)
+            self.candidate_grounding_head = nn.Sequential(
+                nn.Linear(self.d_model * 4, self.d_model),
+                nn.GELU(),
+                nn.Dropout(kwargs['dropout']),
+                nn.Linear(self.d_model, 1),
+            )
 
         if self.use_sparse_world_model:
             if self.frame_topK < self.world_context_frames + 1:
@@ -630,6 +647,15 @@ class VideoQAmodel(nn.Module):
             raise ValueError("world mode must be 'off', 'factual', or 'full'")
         self.world_mode = mode
 
+    def set_candidate_grounding_mode(self, mode):
+        mode = str(mode).lower()
+        if mode not in {"answer_only", "grounding_only", "answer_plus_grounding"}:
+            raise ValueError(
+                "candidate grounding mode must be 'answer_only', "
+                "'grounding_only', or 'answer_plus_grounding'"
+            )
+        self.candidate_grounding_mode = mode
+
     def train(self, mode=True):
         super().train(mode)
         if (
@@ -809,6 +835,75 @@ class VideoQAmodel(nn.Module):
             memory_key_padding_mask=memory_valid_mask,
         )
         return event_tokens.reshape(B, K, D)
+
+    def _apply_candidate_grounding(
+        self,
+        cand_feat,
+        grounding_memory,
+        answer_score,
+        mode=None,
+        alpha=None,
+        grounding_mask=None,
+    ):
+        if not self.use_candidate_grounding:
+            return answer_score, {}
+
+        mode = self.candidate_grounding_mode if mode is None else str(mode).lower()
+        if mode not in {"answer_only", "grounding_only", "answer_plus_grounding"}:
+            raise ValueError(
+                "candidate grounding mode must be 'answer_only', "
+                "'grounding_only', or 'answer_plus_grounding'"
+            )
+        alpha = self.candidate_grounding_alpha if alpha is None else float(alpha)
+
+        query = self.candidate_grounding_q(cand_feat)
+        key = self.candidate_grounding_k(grounding_memory)
+        value = self.candidate_grounding_v(grounding_memory)
+        attn_logits = torch.bmm(query, key.transpose(1, 2)) / math.sqrt(
+            float(self.d_model)
+        )
+        if grounding_mask is not None:
+            # grounding_mask follows this codebase convention: True = valid.
+            attn_logits = attn_logits.masked_fill(
+                ~grounding_mask.bool().unsqueeze(1),
+                torch.finfo(attn_logits.dtype).min,
+            )
+        attention = torch.softmax(attn_logits, dim=-1)
+        evidence = torch.bmm(attention, value)
+        evidence = self.candidate_grounding_norm(evidence)
+
+        grounding_feat = torch.cat(
+            (
+                cand_feat,
+                evidence,
+                cand_feat * evidence,
+                (cand_feat - evidence).abs(),
+            ),
+            dim=-1,
+        )
+        grounding_score = self.candidate_grounding_head(
+            grounding_feat
+        ).squeeze(-1)
+
+        if mode == "answer_only":
+            final_score = answer_score
+        elif mode == "grounding_only":
+            final_score = grounding_score
+        else:
+            final_score = answer_score + alpha * grounding_score
+
+        return final_score, {
+            "base_answer_score": answer_score,
+            "candidate_grounding_score": grounding_score,
+            "candidate_grounding_evidence": evidence,
+            "candidate_grounding_attention": attention,
+            "candidate_grounding_alpha": torch.full(
+                (answer_score.size(0),),
+                float(alpha),
+                device=answer_score.device,
+                dtype=answer_score.dtype,
+            ),
+        }
 
     def _fuse_frame_objects(self, frame_local, obj_local, obj_padding_mask=None):
         if self.fo_fusion_mode == "local":
@@ -1014,7 +1109,8 @@ class VideoQAmodel(nn.Module):
     def forward(
         self, frame_feat, obj_feat, qns_word, ans_word, return_aux=False,
         q_family_id=None, knowledge_feat=None, world_mode=None,
-        world_question_permutation=None,
+        world_question_permutation=None, candidate_grounding_mode=None,
+        candidate_grounding_alpha=None,
     ):
         """
         :param frame_feat:[bs, T, frame_feat_dim] e.g., [bs, 16, 4096]
@@ -1138,6 +1234,14 @@ class VideoQAmodel(nn.Module):
 
         # candidate decoding
         cand_feat, answer_score, evidence_score = self.decode_candidates(out)
+        answer_score, grounding_aux = self._apply_candidate_grounding(
+            cand_feat,
+            frame_obj,
+            answer_score,
+            mode=candidate_grounding_mode,
+            alpha=candidate_grounding_alpha,
+            grounding_mask=frame_mask,
+        )
         mem_pool = self.pool_memory(mem, mem_mask=frame_qns_mask)
 
         # Backward-compatible names
@@ -1154,6 +1258,7 @@ class VideoQAmodel(nn.Module):
                 **selector_aux,
                 **causal_aux,
                 **world_aux,
+                **grounding_aux,
             }
 
         if q_family_id is not None:
@@ -1173,7 +1278,8 @@ class VideoQAmodel(nn.Module):
         self, frame_feat, obj_feat, text_feat, return_aux=False,
         q_family_id=None, knowledge_feat=None, question_feat=None,
         question_mask=None, world_mode=None,
-        world_question_permutation=None,
+        world_question_permutation=None, candidate_grounding_mode=None,
+        candidate_grounding_alpha=None,
     ):
         """
         Forward pass using pre-extracted text features (bypasses DeBERTa).
@@ -1314,6 +1420,14 @@ class VideoQAmodel(nn.Module):
         
         # candidate decoding
         cand_feat, answer_score, evidence_score = self.decode_candidates(out)
+        answer_score, grounding_aux = self._apply_candidate_grounding(
+            cand_feat,
+            frame_obj,
+            answer_score,
+            mode=candidate_grounding_mode,
+            alpha=candidate_grounding_alpha,
+            grounding_mask=frame_mask,
+        )
         mem_pool = self.pool_memory(mem, mem_mask=frame_qns_mask)
 
         # Backward-compatible names
@@ -1330,6 +1444,7 @@ class VideoQAmodel(nn.Module):
                 **selector_aux,
                 **causal_aux,
                 **world_aux,
+                **grounding_aux,
             }
 
         if q_family_id is not None:
