@@ -336,9 +336,19 @@ class VideoQAmodel(nn.Module):
         #   bbox = [..., -4:]    -> 2D sinusoidal pos embed -> d_model
         # Then sum + LayerNorm. Controlled by obj_use_bbox_pos_embed.
         self.obj_bbox_dim = int(obj_bbox_dim)
-        self.obj_use_bbox_pos_embed = bool(obj_use_bbox_pos_embed) and bool(use_grounding_dino)
-        self.obj_hard_gather_from_frame = bool(obj_hard_gather_from_frame) and bool(use_grounding_dino)
-        self.obj_split_siglip2 = bool(obj_split_siglip2) and self.obj_use_bbox_pos_embed
+        # BBox-aware object encoding is useful for both GroundingDINO/SigLIP2
+        # and legacy Faster R-CNN features. Faster R-CNN uses 2048 ROI dims +
+        # 5 bbox/area dims (=2053), while SigLIP2 uses 768 ROI + 768 class + 4
+        # bbox dims (=1540). Keep SigLIP2 semantic splitting opt-in and gated
+        # by use_grounding_dino, but allow bbox positional embedding and hard
+        # frame-gather for legacy object features too.
+        self.obj_use_bbox_pos_embed = bool(obj_use_bbox_pos_embed)
+        self.obj_hard_gather_from_frame = bool(obj_hard_gather_from_frame)
+        self.obj_split_siglip2 = (
+            bool(obj_split_siglip2)
+            and self.obj_use_bbox_pos_embed
+            and bool(use_grounding_dino)
+        )
         self.obj_roi_dim = int(obj_roi_dim)
         self.obj_class_dim = int(obj_class_dim)
         self.obj_expected_dim = int(obj_feat_dim)
@@ -1508,7 +1518,12 @@ class BBoxPosEmbed2D(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, bbox):
-        # bbox: [..., 4] in [0, 1] order [x1, y1, x2, y2]
+        # bbox: [..., 4+] in [0, 1] order [x1, y1, x2, y2, optional_area]
+        if bbox.size(-1) < 4:
+            raise ValueError(f"bbox must have at least 4 dims, got {bbox.size(-1)}")
+        # Legacy Faster R-CNN features append area as a 5th bbox feature.
+        # The sinusoidal spatial code only needs [x1,y1,x2,y2].
+        bbox = bbox[..., :4]
         x1, y1, x2, y2 = bbox.unbind(-1)
         cx = (x1 + x2) * 0.5
         cy = (y1 + y2) * 0.5
