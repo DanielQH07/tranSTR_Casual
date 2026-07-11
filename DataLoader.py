@@ -541,21 +541,48 @@ class VideoQADataset(Dataset):
     def _load_object_features(self, vid):
         objs = []
         
-        if self.obj_format == 'kaggle_subdirs':
+        if self.obj_format in ('kaggle_subdirs', 'per_frame'):
             pkl_path = self._find_object_pkl(vid)
             if pkl_path and osp.exists(pkl_path):
                 try:
                     with open(pkl_path, 'rb') as f:
                         data = pkl.load(f)
-                    feats = np.array(data.get('features'))
-                    bboxes = np.array(data.get('bboxes'))
-                    
-                    num_frames = feats.shape[0]
+                    # Current export stores arrays per frame under frames; retain legacy arrays.
+                    frame_records = data.get('frames') if isinstance(data, dict) else None
+                    if isinstance(frame_records, list) and frame_records:
+                        feat_frames, bbox_frames = [], []
+                        for frame in frame_records:
+                            if not isinstance(frame, dict):
+                                continue
+                            feat = next((frame.get(k) for k in ('features', 'roi_features', 'box_features', 'region_features') if frame.get(k) is not None), None)
+                            bbox = next((frame.get(k) for k in ('bboxes', 'boxes', 'boxes_xyxy', 'boxes_xyxy_orig', 'bbox') if frame.get(k) is not None), None)
+                            if feat is None:
+                                continue
+                            feat = np.asarray(feat, dtype=np.float32)
+                            bbox = np.zeros((len(feat), 4), dtype=np.float32) if bbox is None else np.asarray(bbox, dtype=np.float32)
+                            feat_frames.append(feat)
+                            bbox_frames.append(bbox)
+                        if not feat_frames:
+                            raise ValueError("nested FasterRCNN frames contain no feature arrays")
+                        feats, bboxes = feat_frames, bbox_frames
+                        num_frames = len(feats)
+                    else:
+                        feats = np.asarray(data.get("features"))
+                        bboxes = np.asarray(data.get("bboxes"))
+                        num_frames = feats.shape[0]
                     indices = np.linspace(0, num_frames - 1, self.topK_frame).astype(int) if num_frames > self.topK_frame else range(num_frames)
                     
                     for i in indices:
-                        feat = torch.from_numpy(feats[i]).float()
-                        bbox = torch.from_numpy(bboxes[i]).float()
+                        feat = torch.from_numpy(np.asarray(feats[i], dtype=np.float32)).float()
+                        bbox = torch.from_numpy(np.asarray(bboxes[i], dtype=np.float32)).float()
+                        if feat.ndim == 1:
+                            feat = feat.unsqueeze(0)
+                        if bbox.ndim == 1:
+                            bbox = bbox.unsqueeze(0)
+                        if feat.ndim > 2:
+                            feat = feat.reshape(-1, feat.shape[-1])
+                        if bbox.ndim > 2:
+                            bbox = bbox.reshape(-1, bbox.shape[-1])
                         
                         if feat.shape[0] > self.obj_num:
                             feat, bbox = feat[:self.obj_num], bbox[:self.obj_num]
@@ -566,8 +593,9 @@ class VideoQADataset(Dataset):
                         
                         bb = torch.from_numpy(transform_bb(bbox.numpy(), 640, 480)).float()
                         objs.append(torch.cat([feat, bb], -1))
-                except:
-                    pass
+                except Exception as exc:
+                    if getattr(self, "verbose", False):
+                        print(f"[FasterRCNN] failed to load {pkl_path}: {exc}")
         
         while len(objs) < self.topK_frame:
             objs.append(torch.zeros(self.obj_num, 2053))
