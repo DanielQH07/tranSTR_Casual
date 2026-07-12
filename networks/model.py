@@ -35,7 +35,9 @@ class VideoQAmodel(nn.Module):
                         use_lora=False, lora_r=8, lora_alpha=16, lora_dropout=0.1,
                         lora_target_modules=None,
                         obj_use_bbox_pos_embed=True, obj_hard_gather_from_frame=True,
-                        obj_bbox_dim=4, **kwargs):
+                        obj_bbox_dim=4, obj_split_roi_class=False,
+                        obj_roi_dim=2048, obj_class_dim=768,
+                        obj_mask_padding=True, **kwargs):
         super(VideoQAmodel, self).__init__()
         self.d_model = kwargs['d_model']
         encoder_dropout = kwargs['encoder_dropout']
@@ -44,6 +46,7 @@ class VideoQAmodel(nn.Module):
         self.use_grounding_dino = use_grounding_dino
         self.objs = objs
         self.obj_feat_dim = obj_feat_dim
+        self.frame_selection_override = None
         # text encoder
         self.text_encoder = AutoModel.from_pretrained(text_encoder_type)
         self.tokenizer = AutoTokenizer.from_pretrained(text_encoder_type)
@@ -92,6 +95,13 @@ class VideoQAmodel(nn.Module):
         self.obj_bbox_dim = int(obj_bbox_dim)
         self.obj_use_bbox_pos_embed = bool(obj_use_bbox_pos_embed) and bool(use_grounding_dino)
         self.obj_hard_gather_from_frame = bool(obj_hard_gather_from_frame) and bool(use_grounding_dino)
+        self.obj_roi_dim = int(obj_roi_dim)
+        self.obj_class_dim = int(obj_class_dim)
+        self.obj_mask_padding = bool(obj_mask_padding)
+        self.obj_split_roi_class = (
+            bool(obj_split_roi_class) and self.obj_use_bbox_pos_embed
+            and self.obj_roi_dim + self.obj_class_dim + self.obj_bbox_dim <= int(obj_feat_dim)
+        )
 
         if self.obj_use_bbox_pos_embed:
             sem_dim = int(obj_feat_dim) - self.obj_bbox_dim
@@ -99,13 +109,19 @@ class VideoQAmodel(nn.Module):
                 raise ValueError(f"obj_feat_dim ({obj_feat_dim}) must be > obj_bbox_dim ({self.obj_bbox_dim})")
             if self.d_model % 8 != 0:
                 raise ValueError(f"d_model must be divisible by 8 for BBoxPosEmbed2D; got {self.d_model}")
-            # Identity kept for backward-compat with checkpoint loading code paths.
             self.obj_pre_norm = nn.Identity()
-            self.obj_sem_norm = nn.LayerNorm(sem_dim)
-            self.obj_resize = FeatureResizer(
-                input_feat_size=sem_dim,
-                output_feat_size=self.d_model,
-                dropout=kwargs['dropout'])
+            if self.obj_split_roi_class:
+                self.obj_roi_norm = nn.LayerNorm(self.obj_roi_dim)
+                self.obj_class_norm = nn.LayerNorm(self.obj_class_dim)
+                self.obj_roi_resize = FeatureResizer(self.obj_roi_dim, self.d_model, kwargs['dropout'])
+                self.obj_class_resize = FeatureResizer(self.obj_class_dim, self.d_model, kwargs['dropout'])
+                self.obj_gate_logits = nn.Parameter(torch.tensor([0.0, 0.0, -2.0]))
+            else:
+                self.obj_sem_norm = nn.LayerNorm(sem_dim)
+                self.obj_resize = FeatureResizer(
+                    input_feat_size=sem_dim,
+                    output_feat_size=self.d_model,
+                    dropout=kwargs['dropout'])
             self.bbox_pos_embed = BBoxPosEmbed2D(d_model=self.d_model, dropout=kwargs['dropout'])
             self.obj_post_pos_norm = nn.LayerNorm(self.d_model)
         else:
@@ -238,10 +254,7 @@ class VideoQAmodel(nn.Module):
         When obj_use_bbox_pos_embed is True, target = sem_dim + bbox_dim (e.g. 2816+4=2820);
         otherwise target = obj_resize.fc.in_features.
         """
-        if self.obj_use_bbox_pos_embed:
-            expected_dim = self.obj_resize.fc.in_features + self.obj_bbox_dim
-        else:
-            expected_dim = self.obj_resize.fc.in_features
+        expected_dim = self.obj_feat_dim
         current_dim = obj_feat.size(-1)
         if current_dim == expected_dim:
             return obj_feat
@@ -249,20 +262,58 @@ class VideoQAmodel(nn.Module):
             return obj_feat[..., :expected_dim]
         return F.pad(obj_feat, (0, expected_dim - current_dim))
 
-    def _encode_objects(self, obj_feat):
-        """Convert raw object features to obj_local of dim d_model.
-        Splits bbox into a 2D sinusoidal positional embedding when
-        obj_use_bbox_pos_embed is True; otherwise uses a single LN+Linear path.
-        """
+    def _object_valid_mask(self, obj_feat):
+        """True denotes a real object slot (the attention convention in this repo)."""
+        if not self.obj_mask_padding:
+            return torch.ones(obj_feat.shape[:-1], dtype=torch.bool, device=obj_feat.device)
+        semantic = obj_feat[..., :-self.obj_bbox_dim] if self.obj_bbox_dim > 0 else obj_feat
+        return semantic.abs().sum(dim=-1) > 1e-8
+
+    def _encode_objects(self, obj_feat, obj_valid_mask=None):
         if self.obj_use_bbox_pos_embed:
-            sem = obj_feat[..., :-self.obj_bbox_dim]
             bbox = obj_feat[..., -self.obj_bbox_dim:]
-            sem = self.obj_sem_norm(sem)
-            sem_proj = self.obj_resize(sem)
             bbox_emb = self.bbox_pos_embed(bbox)
-            return self.obj_post_pos_norm(sem_proj + bbox_emb)
-        obj_feat = self.obj_pre_norm(obj_feat)
-        return self.obj_resize(obj_feat)
+            if self.obj_split_roi_class:
+                roi = obj_feat[..., :self.obj_roi_dim]
+                cls = obj_feat[..., self.obj_roi_dim:self.obj_roi_dim + self.obj_class_dim]
+                roi_proj = self.obj_roi_resize(self.obj_roi_norm(roi))
+                cls_proj = self.obj_class_resize(self.obj_class_norm(cls))
+                gates = 2.0 * torch.sigmoid(self.obj_gate_logits)
+                encoded = self.obj_post_pos_norm(
+                    gates[0] * roi_proj + gates[1] * cls_proj + gates[2] * bbox_emb
+                )
+            else:
+                sem = self.obj_sem_norm(obj_feat[..., :-self.obj_bbox_dim])
+                encoded = self.obj_post_pos_norm(self.obj_resize(sem) + bbox_emb)
+            if obj_valid_mask is not None:
+                encoded = encoded * obj_valid_mask.unsqueeze(-1).to(encoded.dtype)
+            return encoded
+        encoded = self.obj_resize(self.obj_pre_norm(obj_feat))
+        if obj_valid_mask is not None:
+            encoded = encoded * obj_valid_mask.unsqueeze(-1).to(encoded.dtype)
+        return encoded
+
+    def _select_frames(self, frame_att, num_frames):
+        """Return [B,F,K]; deterministic overrides are diagnostic-only."""
+        batch_size = frame_att.size(0)
+        mode = self.frame_selection_override
+        if mode in ('uniform', 'random'):
+            if mode == 'uniform':
+                selected = torch.linspace(0, num_frames - 1, self.frame_topK, device=frame_att.device).round().long()
+            else:
+                generator = torch.Generator(device='cpu').manual_seed(3407)
+                selected = torch.randperm(num_frames, generator=generator)[:self.frame_topK].sort().values.to(frame_att.device)
+            idx = torch.zeros(batch_size, num_frames, self.frame_topK, device=frame_att.device, dtype=frame_att.dtype)
+            idx[:, selected, torch.arange(self.frame_topK, device=frame_att.device)] = 1.0
+            return idx
+        scores = frame_att.flatten(1, 2)
+        if self.training:
+            raw = self.frame_sorter(scores)
+        elif self.hard_eval:
+            raw = HardtopK(scores, self.frame_topK)
+        else:
+            raw = self.frame_sorter(scores)
+        return rearrange(raw, 'b (f q) k -> b f q k', f=num_frames).sum(-2)
 
     def _select_obj_by_frame(self, obj_feat, idx_frame):
         """Pick objects of the top-K selected frames.
@@ -327,35 +378,39 @@ class VideoQAmodel(nn.Module):
                                     output_attentions=True
                                     ) # b,16,d
         
-        if self.training:
-            idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
-        else:
-            if self.hard_eval:
-                idx_frame = rearrange(HardtopK(frame_att.flatten(1,2), self.frame_topK), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
-            else:
-                idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2) # B*16, O, topk
+        idx_frame = self._select_frames(frame_att, F)
 
         frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2) # B, Frame_K, d)
 
         # obj: hard-gather (preserves spatial correspondence) or legacy soft-mix
+        obj_valid_mask = self._object_valid_mask(obj_feat)
         obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
+        obj_valid_mask = self._select_obj_by_frame(
+            obj_valid_mask.unsqueeze(-1).to(obj_feat.dtype), idx_frame
+        ).squeeze(-1) > 1e-6
         obj_feat = self._fit_obj_feat_dim(obj_feat)
-        obj_local = self._encode_objects(obj_feat)
+        obj_local = self._encode_objects(obj_feat, obj_valid_mask=obj_valid_mask)
         
         # Repeat q_local and q_mask for each frame (handle potential batch size mismatch)
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0) if q_mask is not None else None
         
+        obj_decoder_mask = obj_valid_mask.flatten(0, 1).clone()
+        no_valid_obj = ~obj_decoder_mask.any(dim=1)
+        obj_decoder_mask[no_valid_obj, 0] = True
         obj_local, obj_att = self.obj_decoder(obj_local.flatten(0,1),
-                                            q_local_repeated, 
+                                            q_local_repeated,
+                                            tgt_key_padding_mask=obj_decoder_mask,
                                             memory_key_padding_mask=q_mask_repeated,
                                             output_attentions=True
-                                            )  # b*16,O,d        #.view(B, F, O, -1) # b,16,O,d
+                                            )
+        obj_local = obj_local * obj_valid_mask.flatten(0, 1).unsqueeze(-1).to(obj_local.dtype)  # b*16,O,d        #.view(B, F, O, -1) # b,16,O,d
 
         # GroundingDINO: skip obj_sorter (already filtered by text prompt)
         if self.use_grounding_dino:
             # Use all objects (already relevant from text-prompted detection)
             obj_local = obj_local.view(B, self.frame_topK, O, -1)  # [B, frame_topK, objs, d_model]
+            fo_obj_mask = obj_valid_mask.flatten(1, 2)
         else:
             # Original: topK object selection via attention
             if self.training:
@@ -366,14 +421,15 @@ class VideoQAmodel(nn.Module):
                 else:
                     idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2) # B*frame_topK, O, obj_topk
             obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
-
+            fo_obj_mask = torch.ones(B, self.frame_topK * self.obj_topK, dtype=torch.bool, device=device)
 
         ### hierarchy grouping
-        frame_obj = self.fo_decoder(frame_local,
-                                    obj_local.flatten(1,2),
-                                    # query_pos = self.pos_encoder_1d(frame_mask.view(B,F), self.d_model), \
-                                    # memory_key_padding_mask=self.win_mask.unsqueeze(0).repeat(B,1,1).to(device)
-                                    ) # b,16,d
+        safe_fo_obj_mask = fo_obj_mask.clone()
+        safe_fo_obj_mask[~safe_fo_obj_mask.any(dim=1), 0] = True
+        frame_obj = self.fo_decoder(
+            frame_local, obj_local.flatten(1,2),
+            memory_key_padding_mask=safe_fo_obj_mask
+        )
         
         ### overall fusion
         frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
@@ -404,7 +460,11 @@ class VideoQAmodel(nn.Module):
                 "mem": mem,
                 "mem_pool": mem_pool,
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                "frame_selection_prob": idx_frame,
+                "object_valid_ratio": obj_valid_mask.float().mean(dim=(1, 2)),
+                "object_gate_scale": (2.0 * torch.sigmoid(self.obj_gate_logits))
+                    if self.obj_split_roi_class else None
             }
 
         if q_family_id is not None:
@@ -440,7 +500,7 @@ class VideoQAmodel(nn.Module):
         # Use MEAN of 5 choices as question representation for video attention
         # This approximates the question since all choices share the same question
         q_local = text_feat_proj.mean(dim=1, keepdim=True)  # [B, 1, d_model]
-        q_mask = torch.zeros(B, 1, device=device).bool()
+        q_mask = torch.ones(B, 1, device=device).bool()
         
         # Frame decoder with question
         frame_mask = torch.ones(B, F).bool().to(device)
@@ -453,33 +513,37 @@ class VideoQAmodel(nn.Module):
         )
         
         # TopK frame selection
-        if self.training:
-            idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2)
-        else:
-            if self.hard_eval:
-                idx_frame = rearrange(HardtopK(frame_att.flatten(1,2), self.frame_topK), 'b (f q) k -> b f q k', f=F).sum(-2)
-            else:
-                idx_frame = rearrange(self.frame_sorter(frame_att.flatten(1,2)), 'b (f q) k -> b f q k', f=F).sum(-2)
+        idx_frame = self._select_frames(frame_att, F)
         
         frame_local = (frame_local.transpose(1,2) @ idx_frame).transpose(1,2)
         
         # Object processing (hard-gather + bbox pos-embed when enabled)
+        obj_valid_mask = self._object_valid_mask(obj_feat)
         obj_feat = self._select_obj_by_frame(obj_feat, idx_frame)
+        obj_valid_mask = self._select_obj_by_frame(
+            obj_valid_mask.unsqueeze(-1).to(obj_feat.dtype), idx_frame
+        ).squeeze(-1) > 1e-6
         obj_feat = self._fit_obj_feat_dim(obj_feat)
-        obj_local = self._encode_objects(obj_feat)
+        obj_local = self._encode_objects(obj_feat, obj_valid_mask=obj_valid_mask)
         
         q_local_repeated = q_local.repeat_interleave(self.frame_topK, dim=0)
         q_mask_repeated = q_mask.repeat_interleave(self.frame_topK, dim=0)
         
+        obj_decoder_mask = obj_valid_mask.flatten(0, 1).clone()
+        no_valid_obj = ~obj_decoder_mask.any(dim=1)
+        obj_decoder_mask[no_valid_obj, 0] = True
         obj_local, obj_att = self.obj_decoder(
             obj_local.flatten(0,1),
             q_local_repeated,
+            tgt_key_padding_mask=obj_decoder_mask,
             memory_key_padding_mask=q_mask_repeated,
             output_attentions=True
         )
+        obj_local = obj_local * obj_valid_mask.flatten(0, 1).unsqueeze(-1).to(obj_local.dtype)
         
         if self.use_grounding_dino:
             obj_local = obj_local.view(B, self.frame_topK, O, -1)
+            fo_obj_mask = obj_valid_mask.flatten(1, 2)
         else:
             # TopK object selection
             if self.training:
@@ -491,9 +555,15 @@ class VideoQAmodel(nn.Module):
                     idx_obj = rearrange(self.obj_sorter(obj_att.flatten(1,2)), 'b (o q) k -> b o q k', o=O).sum(-2)
             
             obj_local = (obj_local.transpose(1,2) @ idx_obj).transpose(1,2).view(B, self.frame_topK, self.obj_topK, -1)
-        
+            fo_obj_mask = torch.ones(B, self.frame_topK * self.obj_topK, dtype=torch.bool, device=device)
+
         # Hierarchy grouping
-        frame_obj = self.fo_decoder(frame_local, obj_local.flatten(1,2))
+        safe_fo_obj_mask = fo_obj_mask.clone()
+        safe_fo_obj_mask[~safe_fo_obj_mask.any(dim=1), 0] = True
+        frame_obj = self.fo_decoder(
+            frame_local, obj_local.flatten(1,2),
+            memory_key_padding_mask=safe_fo_obj_mask
+        )
         
         # Overall fusion
         frame_mask = torch.ones(B, self.frame_topK).bool().to(device)
@@ -525,7 +595,11 @@ class VideoQAmodel(nn.Module):
                 "mem": mem,
                 "mem_pool": mem_pool,
                 "logits": logits,
-                "verifier_logits": verifier_logits
+                "verifier_logits": verifier_logits,
+                "frame_selection_prob": idx_frame,
+                "object_valid_ratio": obj_valid_mask.float().mean(dim=(1, 2)),
+                "object_gate_scale": (2.0 * torch.sigmoid(self.obj_gate_logits))
+                    if self.obj_split_roi_class else None
             }
 
         if q_family_id is not None:
