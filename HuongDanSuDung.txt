@@ -1,6 +1,40 @@
 HƯỚNG DẪN SỬ DỤNG HỆ THỐNG CAUSALVID / TRANSTR
 ====================================================
 
+0. CÁCH CHẠY ĐƯỢC ƯU TIÊN
+-------------------------
+Dataset gồm raw MP4, DINOv3 feature và object feature có dung lượng lớn. Cách khuyến nghị là chạy
+notebook trong example/ trên Colab hoặc Kaggle, không tải toàn bộ data về máy cá nhân.
+
+Lựa chọn khuyến nghị theo thứ tự:
+
+1) example/train_colab.ipynb - ưu tiên cho cấu hình chính hiện tại.
+   - Bật GPU runtime và Internet.
+   - Cung cấp Colab Secret KAGGLE_API_TOKEN hoặc upload ~/.kaggle/kaggle.json.
+   - Nếu dùng W&B online, thêm WANDB_API_KEY; nếu không thì chọn offline/disabled.
+   - Notebook tự tải DINOv3, object feature, annotation và split bằng KaggleHub rồi kiểm tra path/shape
+     trước khi train với batch size 32, num_workers 0.
+
+2) example/train_kaggle.ipynb - dùng khi muốn attach dataset và chạy hoàn toàn trên Kaggle.
+   - Bật GPU và Internet.
+   - Attach bốn dataset được liệt kê ở mục 3 trước khi Run All.
+   - Dataset đã attach trong /kaggle/input không cần tải lại. Nếu tự tải bằng KaggleHub thì thêm
+     Kaggle Secret KAGGLE_API_TOKEN hoặc cung cấp kaggle.json.
+   - Lưu ý notebook này giữ thí nghiệm n2 gốc: physical batch 8 x accumulation 4 = effective batch 32
+     và còn knowledge loss; nó không hoàn toàn giống train_colab/config.yaml.
+
+3) Inference:
+   - example/inference_colab.ipynb cho Google Colab.
+   - example/inference_kaggle.ipynb cho Kaggle; notebook tự tải checkpoint, feature, annotation, split
+     và raw MP4, sau đó chạy toàn bộ test split và xuất CSV.
+
+Trước khi bấm Run All, phải hoàn tất một trong hai cách xác thực Kaggle:
+- Secret KAGGLE_API_TOKEN (khuyến nghị); hoặc
+- file kaggle.json đặt tại ~/.kaggle/kaggle.json với quyền chmod 600.
+
+Không ghi token vào cell, không commit kaggle.json. Nếu thiếu xác thực hoặc quyền dataset, dừng và sửa
+trước khi train để tránh tốn thời gian GPU/Colab credit.
+
 1. MÃ NGUỒN CHÍNH
 -----------------
 - config.yaml: nguồn cấu hình duy nhất cho train.py và test.py.
@@ -8,7 +42,7 @@ HƯỚNG DẪN SỬ DỤNG HỆ THỐNG CAUSALVID / TRANSTR
 - test.py: nạp checkpoint được khai báo trong config.yaml, đánh giá và xuất prediction CSV.
 - DataLoader.py: đọc DINOv3 feature, object feature, QA và split.
 - networks/: kiến trúc mô hình.
-- download_weight.py: tải checkpoint dựng sẵn vào weights/.
+- tools/download_weight.py: tải checkpoint dựng sẵn vào weights/.
 - example/train_colab.ipynb: chạy train trên Colab.
 - example/train_kaggle.ipynb: chạy train trên Kaggle.
 - example/inference_colab.ipynb: tải weight, inference và tạo CSV hoàn chỉnh.
@@ -20,7 +54,7 @@ HƯỚNG DẪN SỬ DỤNG HỆ THỐNG CAUSALVID / TRANSTR
 Python chạy trực tiếp, không có bước build executable. Sau khi cài môi trường theo HuongDanCaiDat.txt,
 có thể kiểm tra cú pháp các entry point:
 
-    python -m py_compile train.py test.py download_weight.py
+    python -m py_compile train.py test.py tools/download_weight.py
 
 Kiểm tra cấu hình và sự tồn tại/định dạng dữ liệu trước khi tốn GPU:
 
@@ -122,11 +156,11 @@ wandb.upload_checkpoints_at_finish: true; không upload weight ở từng epoch.
 -------------------------------
 Cách A - dùng checkpoint dựng sẵn:
 
-    python download_weight.py
+    python tools/download_weight.py
     python test.py --config config.yaml --check-config
     python test.py --config config.yaml
 
-download_weight.py tải dataset Kaggle danielq07/gdinofrcnn-ncod-hum-model và đặt file:
+tools/download_weight.py tải dataset Kaggle danielq07/gdinofrcnn-ncod-hum-model và đặt file:
 
     weights/best_model_gdinofrcnn_ncod_hum_run1_generic_safe_lora_hn_ema_cos.ckpt
 

@@ -13,7 +13,7 @@ DeBERTa-base, NCOD/LUM/HUM, verifier loss, hard-negative weighting và EMA.
 | `config.yaml` | Cấu hình chung cho train và test / shared train-test configuration |
 | `train.py` | Train local bằng cấu hình YAML / local YAML-driven training |
 | `test.py` | Load checkpoint, inference và xuất CSV / checkpoint evaluation and CSV export |
-| `download_weight.py` | Tải checkpoint từ KaggleHub vào `weights/` |
+| `tools/download_weight.py` | Tải checkpoint từ KaggleHub vào `weights/` |
 | `example/train_colab.ipynb` | Notebook train Colab, batch 32 |
 | `example/inference_colab.ipynb` | Notebook inference Colab và xuất CSV đầy đủ |
 | `example/inference_kaggle.ipynb` | Notebook Kaggle inference toàn bộ test video, đối chiếu raw MP4 và xuất CSV |
@@ -93,7 +93,7 @@ Nguồn weight: `danielq07/gdinofrcnn-ncod-hum-model`. Sau khi cấu hình `KAGG
 và được cấp quyền dataset, chạy:
 
 ```bash
-python download_weight.py
+python tools/download_weight.py
 python test.py --config config.yaml
 ```
 
@@ -189,7 +189,7 @@ weights/best_model_gdinofrcnn_ncod_hum_run1_generic_safe_lora_hn_ema_cos.ckpt
 After granting Kaggle access and configuring `KAGGLE_API_TOKEN`:
 
 ```bash
-python download_weight.py
+python tools/download_weight.py
 python test.py --config config.yaml
 ```
 
