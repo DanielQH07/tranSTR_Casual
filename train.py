@@ -31,7 +31,7 @@ QUESTION_TYPES = (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Train the fixed TranSTR run1 pipeline from a YAML configuration."
+        description="Train the fixed TRUST run1 pipeline from a YAML configuration."
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML configuration")
     parser.add_argument(
@@ -161,7 +161,7 @@ def resolve_device(cfg):
 
 def setup_logger(output_dir, run_name, phase):
     output_dir.mkdir(parents=True, exist_ok=True)
-    log = logging.getLogger(f"transtr.{phase}")
+    log = logging.getLogger(f"trust.{phase}")
     log.setLevel(logging.INFO)
     log.handlers.clear()
     formatter = logging.Formatter("[%(asctime)s] %(message)s", "%Y-%m-%d %H:%M:%S")

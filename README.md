@@ -1,24 +1,81 @@
-# TranSTR-DN — CausalVidQA
+# TRUST — Causal VideoQA
 
-TranSTR run1 dùng DINOv3 frame features, GroundingDINO/Faster R-CNN object features,
-DeBERTa-base, NCOD/LUM/HUM, verifier loss, hard-negative weighting và EMA.
+**TRUST: Task-Routed Uncertainty-aware Spatio-Temporal Reasoning for Causal VideoQA**
 
-**Nguồn cấu hình duy nhất:** [`config.yaml`](./config.yaml). `train.py` và `test.py` chỉ nhận
-đường dẫn YAML; không chỉnh hyperparameter trực tiếp trong hai script.
+TRUST kết hợp định tuyến theo loại tác vụ/câu hỏi, học nhận biết bất định bằng NCOD/LUM/HUM,
+suy luận không-thời gian từ DINOv3 và GroundingDINO/Faster R-CNN, verifier loss,
+hard-negative weighting và EMA.
 
-## Tệp chính / Main files
+TRUST combines task/question routing, uncertainty-aware NCOD/LUM/HUM learning,
+spatio-temporal DINOv3 and GroundingDINO/Faster R-CNN reasoning, verifier loss,
+hard-negative weighting, and EMA.
 
-| Tệp | Mục đích / Purpose |
+**Nguồn cấu hình duy nhất / single configuration source:** [`config.yaml`](./config.yaml).
+`train.py` và `test.py` chỉ nhận đường dẫn YAML; không chỉnh hyperparameter trực tiếp trong script.
+
+## Cấu trúc mã nguồn / Source structure
+
+Cấu trúc dưới đây được đối chiếu với toàn bộ file Git đang theo dõi hoặc chưa bị ignore.
+`backup/` và các file/thư mục khớp `.gitignore` không thuộc gói mã nguồn bên dưới.
+
+```text
+causalvid/
+├── .gitignore
+├── README.md
+├── HuongDanCaiDat.txt
+├── HuongDanSuDung.txt
+├── requirements.txt
+├── config.yaml
+├── train.py
+├── test.py
+├── eval_mc.py
+├── DataLoader.py
+├── networks/
+│   ├── model.py
+│   ├── attention.py
+│   ├── multimodal_transformer.py
+│   ├── position_encoding.py
+│   ├── topk.py
+│   ├── question_router.py
+│   ├── knowledge_retriever.py
+│   ├── encoder.py
+│   ├── EncoderVid.py
+│   └── util.py
+├── utils/
+│   ├── util.py
+│   └── logger.py
+├── tools/
+│   ├── download_weight.py
+│   ├── extractvit.ipynb
+│   └── Groundingdino-FasterRCNN-feat.ipynb
+└── example/
+    ├── train_colab.ipynb
+    ├── train_kaggle.ipynb
+    ├── inference_colab.ipynb
+    └── inference_kaggle.ipynb
+```
+
+| Thành phần | Vai trò / Purpose |
 |---|---|
-| `config.yaml` | Cấu hình chung cho train và test / shared train-test configuration |
-| `train.py` | Train local bằng cấu hình YAML / local YAML-driven training |
-| `test.py` | Load checkpoint, inference và xuất CSV / checkpoint evaluation and CSV export |
-| `tools/download_weight.py` | Tải checkpoint từ KaggleHub vào `weights/` |
-| `example/train_colab.ipynb` | Notebook train Colab, batch 32 |
-| `example/inference_colab.ipynb` | Notebook inference Colab và xuất CSV đầy đủ |
-| `example/inference_kaggle.ipynb` | Notebook Kaggle inference toàn bộ test video, đối chiếu raw MP4 và xuất CSV |
-| `example/train_kaggle.ipynb` | Notebook Kaggle dựa trên notebook n2 gốc |
+| `config.yaml` | Cấu hình chung duy nhất cho train/test |
+| `train.py` | Huấn luyện TRUST, validation, best/last checkpoint và metrics |
+| `test.py` | Load checkpoint, đánh giá và xuất prediction CSV |
+| `eval_mc.py` | Tiện ích đánh giá multiple-choice |
+| `DataLoader.py` | Đọc DINOv3, object feature, QA và split |
+| `networks/` | TRUST model, attention, transformer, Top-K và task routing |
+| `utils/` | Seed/GPU/path/logging utilities |
+| `tools/download_weight.py` | Tải checkpoint dựng sẵn vào `weights/` |
+| `tools/extractvit.ipynb` | Sinh DINOv3 `[16,1024]` từ raw MP4 |
+| `tools/Groundingdino-FasterRCNN-feat.ipynb` | Sinh object feature 2820 chiều |
+| `example/train_colab.ipynb` | Luồng train Colab ưu tiên, batch 32/workers 0 |
+| `example/train_kaggle.ipynb` | Luồng train Kaggle, biến thể n2 legacy |
+| `example/inference_colab.ipynb` | Full test inference trên Colab |
+| `example/inference_kaggle.ipynb` | Full test inference trên Kaggle và đối chiếu raw MP4 |
+| `HuongDanCaiDat.txt` | Hướng dẫn môi trường, thư viện và credential |
+| `HuongDanSuDung.txt` | Hướng dẫn chạy feature/train/test/inference |
 
+> Tên repository/folder `tranSTR_Casual`, một số đường dẫn clone, checkpoint và tên notebook nguồn
+> được giữ nguyên để tương thích với tài nguyên đã công bố. Đây là định danh legacy, không phải tên phương pháp hiện tại.
 ---
 
 # Tiếng Việt
@@ -56,8 +113,8 @@ data/
     └── test.pkl
 ```
 
-`DataLoader.py` không quét đệ quy frame/object feature. Nếu DINOv3 được chia thành
-`train/valid/test`, phải move hoặc symlink toàn bộ `.pt` vào `data/visual_feature/`.
+`DataLoader.py` yêu cầu DINOv3 `.pt` nằm phẳng trong `data/visual_feature/`. Object `.pkl` có thể
+nằm phẳng hoặc trong các thư mục con trực tiếp mà DataLoader quét được.
 
 ## 2. Cấu hình hiện tại
 
@@ -207,7 +264,7 @@ mode to `offline` or `disabled` when uploads are not needed. Training uploads ex
 
 `example/inference_kaggle.ipynb` downloads the fixed Kaggle checkpoint and full raw MP4 dataset,
 runs the complete test split with batch 32/workers 0, verifies raw-video coverage, and adds the
-resolved MP4 path to the output CSV. TranSTR inference still consumes precomputed DINOv3/GDINO features.
+resolved MP4 path to the output CSV. TRUST inference still consumes precomputed DINOv3/GDINO features.
 
 > `example/train_kaggle.ipynb` intentionally retains the original n2 knowledge loss and memory
 > post-check; it is not identical to the knowledge-disabled YAML pipeline.

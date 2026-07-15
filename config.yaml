@@ -1,4 +1,4 @@
-# TranSTR run1 configuration shared by train.py and test.py.
+# TRUST run1 configuration shared by train.py and test.py.
 # Chinh tat ca tham so tai file nay; khong sua hard-coded value trong script.
 
 schema_version: 1
@@ -117,7 +117,7 @@ resume:
 wandb:
   mode: online
   api_key_env: WANDB_API_KEY
-  project: transtr-causalvid-dino
+  project: trust-causal-videoqa
   entity: null
   watch_gradients: true
   gradient_log_frequency: 100

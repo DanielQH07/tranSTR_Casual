@@ -23,7 +23,7 @@ from train import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate TranSTR with the same YAML configuration used for training."
+        description="Evaluate TRUST with the same YAML configuration used for training."
     )
     parser.add_argument("--config", default="config.yaml", help="Path to YAML configuration")
     parser.add_argument(

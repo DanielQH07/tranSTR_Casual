@@ -1,5 +1,9 @@
-HƯỚNG DẪN SỬ DỤNG HỆ THỐNG CAUSALVID / TRANSTR
+HƯỚNG DẪN SỬ DỤNG PHƯƠNG PHÁP TRUST CHO CAUSAL VIDEOQA
 ====================================================
+
+TÊN PHƯƠNG PHÁP
+-----------------
+TRUST: Task-Routed Uncertainty-aware Spatio-Temporal Reasoning for Causal VideoQA
 
 0. CÁCH CHẠY ĐƯỢC ƯU TIÊN
 -------------------------
@@ -38,16 +42,24 @@ trước khi train để tránh tốn thời gian GPU/Colab credit.
 1. MÃ NGUỒN CHÍNH
 -----------------
 - config.yaml: nguồn cấu hình duy nhất cho train.py và test.py.
-- train.py: huấn luyện, validation, lưu best/last checkpoint và metric.
-- test.py: nạp checkpoint được khai báo trong config.yaml, đánh giá và xuất prediction CSV.
+- train.py: huấn luyện TRUST, validation, lưu best/last checkpoint và metric.
+- test.py: nạp checkpoint, đánh giá và xuất prediction CSV.
+- eval_mc.py: tiện ích đánh giá multiple-choice.
 - DataLoader.py: đọc DINOv3 feature, object feature, QA và split.
-- networks/: kiến trúc mô hình.
+- networks/: model TRUST, attention, multimodal transformer, Top-K và task routing.
+- utils/: tiện ích seed, GPU, path và logging.
+- requirements.txt: danh sách thư viện Python; không chứa bản sao thư viện.
 - tools/download_weight.py: tải checkpoint dựng sẵn vào weights/.
-- example/train_colab.ipynb: chạy train trên Colab.
-- example/train_kaggle.ipynb: chạy train trên Kaggle.
-- example/inference_colab.ipynb: tải weight, inference và tạo CSV hoàn chỉnh.
-- tools/extractvit.ipynb: sinh duy nhất DINOv3 frame feature từ toàn bộ MP4.
+- tools/extractvit.ipynb: sinh DINOv3 frame feature từ toàn bộ MP4.
 - tools/Groundingdino-FasterRCNN-feat.ipynb: sinh GroundingDINO + Faster R-CNN object feature.
+- example/train_colab.ipynb: train TRUST trên Colab, cấu hình chính batch 32/workers 0.
+- example/train_kaggle.ipynb: train Kaggle, biến thể n2 legacy.
+- example/inference_colab.ipynb: tải data/weight, inference và tạo CSV hoàn chỉnh trên Colab.
+- example/inference_kaggle.ipynb: inference toàn bộ test split trên Kaggle, đối chiếu raw MP4.
+- README.md, HuongDanCaiDat.txt, HuongDanSuDung.txt: tài liệu bàn giao.
+- .gitignore: loại dữ liệu, cache, secret và backup khỏi gói mã nguồn.
+
+Thư mục backup/ bị ignore và không được tính vào cấu trúc mã nguồn bàn giao.
 
 2. BIÊN DỊCH / KIỂM TRA MÃ NGUỒN
 --------------------------------

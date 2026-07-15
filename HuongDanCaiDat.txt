@@ -1,5 +1,12 @@
-HƯỚNG DẪN CÀI ĐẶT HỆ THỐNG CAUSALVID / TRANSTR
+HƯỚNG DẪN CÀI ĐẶT PHƯƠNG PHÁP TRUST CHO CAUSAL VIDEOQA
 ====================================================
+
+TÊN PHƯƠNG PHÁP
+-----------------
+TRUST: Task-Routed Uncertainty-aware Spatio-Temporal Reasoning for Causal VideoQA
+
+Tên TRUST được dùng trong tài liệu, mô tả chương trình và các run mới. Tên repository/folder
+tranSTR_Casual chỉ được giữ để tương thích với đường dẫn GitHub hiện có.
 
 1. MỤC ĐÍCH
 ------------
