@@ -1,0 +1,139 @@
+# TranSTR run1 configuration shared by train.py and test.py.
+# Chinh tat ca tham so tai file nay; khong sua hard-coded value trong script.
+
+schema_version: 1
+
+run:
+  name: run1_colab_bs32_ncod_hum_verifier
+  seed: 999
+  gpu: 0
+  require_cuda: true
+  output_dir: ./outputs/models
+
+data:
+  # Default: datasets are downloaded manually into ./data.
+  # Paths may be absolute or relative to this config.yaml file.
+  source: local
+  local_paths:
+    # Must directly contain all train/valid/test .pt files in one flat directory.
+    video_feature_root: ./data/visual_feature
+    # Must directly contain one {video_id}.pkl file per video.
+    grounding_dino_path: ./data/object_feature
+    # Must contain {video_id}/text.json and {video_id}/answer.json directories.
+    sample_list_path: ./data/text_annotation/QA
+    # Must directly contain train.pkl, valid.pkl, and test.pkl.
+    split_dir: ./data/data_split/split
+  kagglehub:
+    token_env: KAGGLE_API_TOKEN
+    dinov3_slug: danielq07/dinov3-feat
+    grounding_dino_slug: danielq07/causal-vidqa-gdinofasterrcnn-features-merged
+    annotation_slug: lusnaw/text-annotation
+    split_slug: danielq07/casual-vid-data-split
+    merged_dinov3_path: /content/dinov3_T16_dim1024_merge
+    env_overrides:
+      dinov3: DINOV3_DATASET_PATH
+      grounding_dino: GDINO_DATASET_PATH
+      annotation: ANNO_DATASET_PATH
+      split: SPLIT_DATASET_PATH
+      grounding_dino_slug: GDINO_DATASET
+  input_frames: 16
+  objects_per_frame: 12
+  answer_candidates: 5
+  max_samples: null
+  return_family_id: true
+  num_workers: 0
+  pin_memory: false
+  object_feature_guard: true
+
+model:
+  frame_feat_dim: 1024
+  obj_feat_dim: 2820
+  selected_frames: 5
+  topk_objects: 5
+  use_grounding_dino: true
+  obj_use_bbox_pos_embed: true
+  obj_bbox_dim: 4
+  obj_hard_gather_from_frame: true
+  obj_split_roi_class: false
+  obj_roi_dim: 2048
+  obj_class_dim: 768
+  obj_mask_padding: true
+  hard_eval: false
+  d_model: 768
+  word_dim: 768
+  nheads: 8
+  num_encoder_layers: 2
+  normalize_before: true
+  activation: gelu
+  dropout: 0.3
+  encoder_dropout: 0.3
+  text_encoder_type: microsoft/deberta-base
+  freeze_text_encoder: false
+  num_question_families: 6
+  remove_knowledge_modules: true
+  lambda_knowledge: 0.0
+
+training:
+  epochs: 10
+  batch_size: 32
+  accumulation_steps: 1
+  model_optimizer: adamw
+  main_lr: 1.0e-5
+  text_encoder_lr: 5.0e-6
+  weight_decay: 1.0e-4
+  gradient_clip_max_norm: 1.0
+  verifier_weight: 0.25
+  auxiliary_warmup_epochs: 2
+  hard_negative:
+    enabled: true
+    max_weight: 1.5
+  ema:
+    enabled: true
+    decay: 0.999
+  ncod:
+    optimizer: sgd
+    u_lr: 0.1
+    hum_alpha: 1.0
+    hard_family_min_id: 2
+    u_init: 1.0e-8
+    u_clamp_min: 0.0
+    u_clamp_max: 0.99
+  scheduler:
+    type: cosine_warmup
+    warmup_epochs: 1
+    min_lr: 1.0e-7
+  early_stopping:
+    start_epoch: 5
+    patience: 4
+    min_delta: 0.05
+
+resume:
+  enabled: true
+  # auto = W&B when mode=online, otherwise local.
+  source: auto
+  local_checkpoint_path: null
+  artifact_alias: latest
+
+wandb:
+  mode: online
+  api_key_env: WANDB_API_KEY
+  project: transtr-causalvid-dino
+  entity: null
+  watch_gradients: true
+  gradient_log_frequency: 100
+  upload_checkpoints_at_finish: true
+
+evaluation:
+  weighted_score:
+    predictive_reason: 0.35
+    counterfactual_reason: 0.35
+    acc_all: 0.20
+    best_val_acc: 0.10
+
+test:
+  # Download with: python download_weight.py
+  # Source: danielq07/gdinofrcnn-ncod-hum-model
+  checkpoint_path: ./weights/best_model_gdinofrcnn_ncod_hum_run1_generic_safe_lora_hn_ema_cos.ckpt
+  use_ema_weights: true
+  predictions_csv: null
+  metrics_json: null

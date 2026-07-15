@@ -15,7 +15,5 @@ log/*
 *.secret
 docs/*
 __pycache__
-prediction/*
-log/*
-data/*
-qwen/*
+backup/*
+NCOD/*

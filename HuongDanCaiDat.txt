@@ -1,0 +1,129 @@
+HƯỚNG DẪN CÀI ĐẶT HỆ THỐNG CAUSALVID / TRANSTR
+====================================================
+
+1. MỤC ĐÍCH
+------------
+Tài liệu này hướng dẫn cài công cụ, môi trường phát triển và thư viện để:
+- sinh DINOv3 frame feature;
+- sinh GroundingDINO + Faster R-CNN object feature;
+- huấn luyện mô hình bằng train.py;
+- suy luận, đánh giá và xuất CSV bằng test.py hoặc notebook inference.
+
+Mã nguồn là Python nên không cần trình biên dịch C/C++ riêng cho luồng train/test thông thường.
+Detectron2 trong notebook object feature có extension C++/CUDA và được notebook cài tự động trên Google Colab.
+
+2. CÔNG CỤ VÀ MÔI TRƯỜNG KHUYẾN NGHỊ
+-------------------------------------
+- Hệ điều hành: Windows 10/11 hoặc Ubuntu 20.04 trở lên.
+- Python: 3.10 (khuyến nghị).
+- Quản lý môi trường: Miniconda/Anaconda hoặc python -m venv.
+- IDE: Visual Studio Code + Python/Jupyter extension, hoặc JupyterLab.
+- Git: dùng để lấy và quản lý mã nguồn.
+- GPU NVIDIA có CUDA: cần cho train và sinh feature. Khuyến nghị GPU từ 16 GB VRAM; batch size 32 có thể cần giảm nếu GPU thiếu bộ nhớ.
+- Google Colab/Kaggle Notebook có GPU: khuyến nghị cho hai notebook trong thư mục tools/.
+
+3. LƯU Ý VỀ THƯ VIỆN
+---------------------
+Gói bàn giao KHÔNG chứa bản sao thư viện, môi trường ảo, CUDA toolkit, cache pip/conda, dữ liệu lớn hoặc model cache.
+Chỉ có requirements.txt và các cell cài đặt trong notebook để người dùng tự cài thư viện.
+Không chép các thư mục venv/, .venv/, site-packages/, miniconda/, .cache/ hoặc detectron2 build vào mã nguồn.
+
+4. CÀI MÔI TRƯỜNG TRAIN/TEST TRÊN MÁY CỤC BỘ
+---------------------------------------------
+Bước 1 - mở Terminal/PowerShell tại thư mục gốc dự án.
+
+Bước 2 - tạo môi trường:
+
+    conda create -n causalvid python=3.10 -y
+    conda activate causalvid
+    python -m pip install --upgrade pip setuptools wheel
+
+Nếu không dùng Conda:
+
+    python -m venv .venv
+
+Windows PowerShell:
+
+    .\.venv\Scripts\Activate.ps1
+
+Linux/macOS:
+
+    source .venv/bin/activate
+
+Bước 3 - cài PyTorch phù hợp GPU/driver.
+Lấy lệnh chính xác tại https://pytorch.org/get-started/locally/ . Ví dụ máy dùng CUDA 12.1:
+
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+Máy chỉ dùng CPU (chỉ phù hợp kiểm tra cấu hình/syntax, train sẽ rất chậm):
+
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+Bước 4 - cài các thư viện Python còn lại:
+
+    pip install -r requirements.txt
+
+Bước 5 - kiểm tra nhanh:
+
+    python -c "import torch, transformers, einops, yaml, pandas; print(torch.__version__); print('CUDA:', torch.cuda.is_available())"
+    python train.py --config config.yaml --check-config
+    python test.py --config config.yaml --check-config
+
+5. TÀI KHOẢN VÀ SECRET
+----------------------
+Không ghi API key/token trực tiếp trong mã nguồn hoặc notebook.
+
+- Kaggle: tạo token tại phần Settings/API của tài khoản Kaggle.
+  + Máy cục bộ: đăng nhập theo hướng dẫn của kagglehub hoặc đặt KAGGLE_API_TOKEN trong biến môi trường.
+  + Kaggle Notebook: dataset công khai thường tải trực tiếp được; nếu cần, thêm secret KAGGLE_API_TOKEN.
+  + Colab notebook object feature hiện dùng hai Colab Secret KAGGLE_USERNAME và KAGGLE_KEY.
+- Hugging Face: model DINOv3 có thể yêu cầu chấp nhận điều khoản truy cập tại trang model
+  facebook/dinov3-vitl16-pretrain-lvd1689m. Sau đó tạo read token và thêm secret HF_TOKEN.
+- Weights & Biases: nếu config.yaml đặt wandb.mode: online, thêm WANDB_API_KEY.
+  Không muốn gửi log: đặt wandb.mode: offline hoặc disabled trong config.yaml.
+
+Windows PowerShell, chỉ cho phiên Terminal hiện tại:
+
+    $env:WANDB_API_KEY="..."
+    $env:HF_TOKEN="..."
+    $env:KAGGLE_API_TOKEN="..."
+
+Linux/macOS:
+
+    export WANDB_API_KEY="..."
+    export HF_TOKEN="..."
+    export KAGGLE_API_TOKEN="..."
+
+6. THƯ VIỆN CHO CÁC NOTEBOOK SINH FEATURE
+-----------------------------------------
+a) tools/extractvit.ipynb - chỉ sinh DINOv3 feature
+Notebook tự cài kagglehub, transformers, decord và tqdm. Chọn GPU accelerator trước khi Run All.
+Không cần cài các thư viện này vào môi trường train nếu chỉ dùng feature đã sinh sẵn.
+
+b) tools/Groundingdino-FasterRCNN-feat.ipynb - sinh object feature
+Notebook dành cho Google Colab GPU và tự cài transformers, accelerate, huggingface_hub, spaCy, decord,
+GroundingDINO/Detectron2 cùng model en_core_web_sm. Detectron2 phụ thuộc phiên bản PyTorch/CUDA của runtime,
+vì vậy nên chạy cell cài đặt trong notebook thay vì sao chép thư viện đã build từ máy khác.
+
+7. CẤU TRÚC DỮ LIỆU SAU KHI CÀI
+--------------------------------
+Các đường dẫn mặc định trong config.yaml:
+
+    data/
+      visual_feature/       # <video_id>.pt, DINOv3 [16, 1024]
+      object_feature/       # <video_id>.pkl, object [16, 12, 2820] sau DataLoader chuẩn hóa/pad
+      text_annotation/QA/   # câu hỏi và đáp án
+      data_split/split/     # danh sách train/valid/test
+    weights/                # checkpoint để test
+    outputs/models/         # checkpoint, metric và prediction khi chạy
+
+Không bắt buộc đưa dữ liệu lớn vào Git. Có thể tải feature dựng sẵn theo HuongDanSuDung.txt và README.md.
+
+8. XỬ LÝ LỖI CÀI ĐẶT THƯỜNG GẶP
+--------------------------------
+- torch.cuda.is_available() = False: kiểm tra NVIDIA driver, bản PyTorch CUDA và Runtime GPU trên Colab/Kaggle.
+- ModuleNotFoundError: kích hoạt đúng môi trường rồi chạy lại pip install -r requirements.txt.
+- DINOv3 báo 401/403: chấp nhận điều khoản model và kiểm tra HF_TOKEN.
+- KaggleHub báo 401/403: kiểm tra token và quyền truy cập dataset.
+- Detectron2 build lỗi: restart Colab runtime, bật GPU rồi chạy notebook từ đầu theo đúng thứ tự cell.
+- CUDA out of memory: giảm batch size trong config.yaml; cấu hình chính của dự án là 32 nhưng phần cứng có thể không đủ VRAM.

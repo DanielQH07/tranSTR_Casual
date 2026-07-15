@@ -1,0 +1,160 @@
+HƯỚNG DẪN SỬ DỤNG HỆ THỐNG CAUSALVID / TRANSTR
+====================================================
+
+1. MÃ NGUỒN CHÍNH
+-----------------
+- config.yaml: nguồn cấu hình duy nhất cho train.py và test.py.
+- train.py: huấn luyện, validation, lưu best/last checkpoint và metric.
+- test.py: nạp checkpoint được khai báo trong config.yaml, đánh giá và xuất prediction CSV.
+- DataLoader.py: đọc DINOv3 feature, object feature, QA và split.
+- networks/: kiến trúc mô hình.
+- download_weight.py: tải checkpoint dựng sẵn vào weights/.
+- example/train_colab.ipynb: chạy train trên Colab.
+- example/train_kaggle.ipynb: chạy train trên Kaggle.
+- example/inference_colab.ipynb: tải weight, inference và tạo CSV hoàn chỉnh.
+- tools/extractvit.ipynb: sinh duy nhất DINOv3 frame feature từ toàn bộ MP4.
+- tools/Groundingdino-FasterRCNN-feat.ipynb: sinh GroundingDINO + Faster R-CNN object feature.
+
+2. BIÊN DỊCH / KIỂM TRA MÃ NGUỒN
+--------------------------------
+Python chạy trực tiếp, không có bước build executable. Sau khi cài môi trường theo HuongDanCaiDat.txt,
+có thể kiểm tra cú pháp các entry point:
+
+    python -m py_compile train.py test.py download_weight.py
+
+Kiểm tra cấu hình và sự tồn tại/định dạng dữ liệu trước khi tốn GPU:
+
+    python train.py --config config.yaml --check-config
+    python test.py --config config.yaml --check-config
+
+Chỉ bắt đầu train/test khi hai lệnh trên không báo lỗi.
+
+3. CHUẨN BỊ DỮ LIỆU - CÁCH NHANH (FEATURE ĐÃ SINH SẴN)
+------------------------------------------------------
+Tải và giải nén bốn dataset sau, sau đó đặt đúng thư mục:
+
+- DINOv3: https://www.kaggle.com/datasets/danielq07/dinov3-feat
+  -> data/visual_feature/
+- GroundingDINO + Faster R-CNN:
+  https://www.kaggle.com/datasets/danielq07/causal-vidqa-gdinofasterrcnn-features-merged
+  -> data/object_feature/
+- QA annotation: https://www.kaggle.com/datasets/lusnaw/text-annotation
+  -> data/text_annotation/
+- Data split: https://www.kaggle.com/datasets/danielq07/casual-vid-data-split
+  -> data/data_split/
+
+Không cần chạy hai notebook sinh feature nếu dùng các dataset này. Sau khi giải nén, tránh lồng thêm một cấp
+thư mục khiến config.yaml không tìm thấy file. Có thể sửa trực tiếp các path tại data.local_paths trong config.yaml.
+
+4. CHUẨN BỊ DỮ LIỆU - TỰ SINH FEATURE
+--------------------------------------
+4.1. Sinh DINOv3 feature
+
+1) Đưa tools/extractvit.ipynb lên Kaggle Notebook.
+2) Settings -> Accelerator -> chọn GPU.
+3) Nếu model yêu cầu xác thực, thêm Kaggle Secret tên HF_TOKEN và bật quyền truy cập secret cho notebook.
+4) Run All.
+
+Notebook tải trực tiếp full MP4 bằng:
+
+    kagglehub.dataset_download("danielq07/causal-vidqa-raw-video-full")
+
+Notebook quét đệ quy tất cả file .mp4; không dùng split pickle, không tải part phụ và không ghép video.
+Mỗi video được lấy đều 16 frame, chạy model facebook/dinov3-vitl16-pretrain-lvd1689m và lưu:
+
+    /kaggle/working/dinov3_features/<video_id>.pt
+
+Mỗi file là torch.Tensor float32 có shape [16, 1024]. Notebook hỗ trợ chạy lại: file đúng shape đã có sẽ được bỏ qua.
+Sau khi hoàn tất, Save Version/Download Output rồi chép các file .pt vào data/visual_feature/.
+
+4.2. Sinh GroundingDINO + Faster R-CNN object feature
+
+1) Mở tools/Groundingdino-FasterRCNN-feat.ipynb trên Google Colab và bật GPU.
+2) Thêm Colab Secrets KAGGLE_USERNAME, KAGGLE_KEY; thêm HF_TOKEN nếu cần tải/upload Hugging Face.
+3) Chạy các cell theo thứ tự: cài dependency -> cài Detectron2 -> config/data -> load model -> smoke test -> main loop -> verify.
+4) Notebook hiện chia video theo PART_ID = 1..5. Chạy đủ các part nếu tự dựng toàn bộ object feature.
+5) Giải nén các file .pkl từ zip output và gom vào data/object_feature/. DataLoader chấp nhận cấu trúc phẳng
+   hoặc các thư mục con chứa <video_id>.pkl.
+
+Mỗi frame trong .pkl có:
+- roi_features [N, 2048] từ Faster R-CNN;
+- class_text_embedding [N, 768] từ DeBERTa;
+- boxes_xyxy_orig [N, 4].
+
+DataLoader nối thành 2820 chiều, lấy/pad 16 frame và tối đa 12 object/frame. Nếu thiếu object, tensor được pad 0
+để luôn khớp cấu hình model.obj_feat_dim: 2820.
+
+5. CẤU HÌNH TRƯỚC KHI CHẠY
+--------------------------
+Mở config.yaml và kiểm tra tối thiểu:
+
+- data.local_paths: bốn đường dẫn dữ liệu;
+- data.input_frames: 16;
+- data.objects_per_frame: 12;
+- data.num_workers: 0 (an toàn cho Colab/Windows);
+- model.frame_feat_dim: 1024;
+- model.obj_feat_dim: 2820;
+- model.selected_frames: 5;
+- training.batch_size: 32;
+- wandb.mode: online, offline hoặc disabled;
+- test.checkpoint_path: đường dẫn checkpoint cần nạp.
+
+Không sửa cấu hình trực tiếp trong train.py/test.py. Nếu GPU OOM, chỉ giảm training.batch_size trong config.yaml.
+
+6. HUẤN LUYỆN
+--------------
+Tại thư mục gốc dự án:
+
+    python train.py --config config.yaml --check-config
+    python train.py --config config.yaml
+
+Kết quả mặc định nằm tại outputs/models/:
+- best_model_<run_name>.ckpt;
+- last_checkpoint_<run_name>.ckpt;
+- train_history_<run_name>.csv;
+- final_metrics_<run_name>.json;
+- test_predictions_<run_name>.csv.
+
+Nếu wandb.mode là online, đặt WANDB_API_KEY trước khi chạy. Hệ thống chỉ upload checkpoint best và last khi
+wandb.upload_checkpoints_at_finish: true; không upload weight ở từng epoch.
+
+7. TEST / INFERENCE VÀ XUẤT CSV
+-------------------------------
+Cách A - dùng checkpoint dựng sẵn:
+
+    python download_weight.py
+    python test.py --config config.yaml --check-config
+    python test.py --config config.yaml
+
+download_weight.py tải dataset Kaggle danielq07/gdinofrcnn-ncod-hum-model và đặt file:
+
+    weights/best_model_gdinofrcnn_ncod_hum_run1_generic_safe_lora_hn_ema_cos.ckpt
+
+config.yaml phải trỏ test.checkpoint_path tới file trên. test.py ưu tiên EMA weight nếu test.use_ema_weights: true.
+CSV prediction được ghi vào thư mục run.output_dir.
+
+Cách B - Colab có giao diện từng bước:
+
+    example/inference_colab.ipynb
+
+Chạy từ đầu đến cuối để tải dữ liệu/weight, nạp model và tạo CSV hoàn chỉnh.
+
+8. KIỂM TRA KẾT QUẢ
+-------------------
+- DINOv3: mỗi <video_id>.pt phải là Tensor [16, 1024].
+- Object: mỗi video phải có .pkl; DataLoader trả [16, 12, 2820].
+- Không được có NaN/Inf; train.py có object_feature_guard để dừng sớm khi shape sai.
+- Số video feature phải phủ các video trong split đang chạy.
+- CSV inference phải có đủ ID/mẫu mà test split yêu cầu.
+
+9. DỌN FILE TRUNG GIAN TRƯỚC KHI BÀN GIAO
+-----------------------------------------
+Có thể xóa các file/thư mục sinh tự động sau khi đã xác nhận kết quả:
+- __pycache__/ và *.pyc;
+- .ipynb_checkpoints/;
+- *.log, *.tmp và cache tải model;
+- zip part sau khi đã giải nén và kiểm tra đủ .pkl;
+- môi trường .venv/ hoặc Conda env (người nhận tự cài lại theo HuongDanCaiDat.txt).
+
+Không xóa mã nguồn, config.yaml, requirements.txt, hai file hướng dẫn, notebook cần chạy lại, checkpoint cần bàn giao,
+feature/dataset duy nhất chưa có bản sao hoặc CSV kết quả cuối cùng.
